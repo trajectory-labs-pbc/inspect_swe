@@ -66,12 +66,14 @@ def claude_code(
     model: str | None = None,
     model_config: str | None = None,
     model_aliases: dict[str, str | Model] | None = None,
+    transparent_proxy: bool = False,
     opus_model: str | None = None,
     sonnet_model: str | None = None,
     haiku_model: str | None = None,
     subagent_model: str | None = None,
     filter: GenerateFilter | None = None,
     permission_mode: str | None = None,
+    allowlist_mcp_tools: bool = True,
     retry_refusals: int | None = 3,
     retry_uncaught_errors: int | None = 3,
     cwd: str | None = None,
@@ -116,6 +118,17 @@ def claude_code(
         model_aliases: Optional mapping of model names to Model instances or model name strings.
             Allows using custom Model implementations (e.g., wrapped Agents) instead of standard models.
             When a model name in the mapping is referenced, the corresponding Model/string is used.
+        transparent_proxy: Run the bridge as a faithful transparent proxy (defaults
+            to `False`). When `True`, each request is routed to the model the agent
+            actually asked for -- no alias table and no fallback collapse onto the
+            session model -- and the client's generation parameters are treated as
+            authoritative. Required when the agent makes internal model calls of its
+            own that must reach their real provider model rather than being served by
+            the session model, e.g. Claude Code's auto-mode security classifier under
+            `auto_mode=True`. With the default `False`, the presented-identity aliases
+            and the fallback model collapse such a request onto the session model, so
+            the classifier is served by the wrong model (and its generation parameters,
+            e.g. `max_tokens`, are dropped).
         opus_model: The model to use for `opus`, or for `opusplan` when Plan Mode is active. Defaults to `model`.
         sonnet_model: The model to use for `sonnet`, or for `opusplan` when Plan Mode is not active. Defaults to `model`.
         haiku_model: The model to use for haiku, or [background functionality](https://code.claude.com/docs/en/costs#background-token-usage). Defaults to `model`.
@@ -127,6 +140,12 @@ def claude_code(
             tool calls so only set if your evaluation can tolerate this; bridged
             MCP tools still need `--allowed-tools` to be usable at all under any
             non-bypass mode (handled automatically -- see `resolve_mcp_servers`).
+        allowlist_mcp_tools: Whether to add bridged/static MCP tools to
+            `--allowed-tools` (default `True`). Set `False` with
+            `permission_mode="auto"` when Claude Code's first-party classifier
+            should review every MCP call: an allow rule resolves before the
+            classifier and would bypass it. The servers remain registered via
+            `--mcp-config`, so their tools can still be invoked.
         retry_refusals: Should refusals be retried? Defaults to retrying up to 3 times.
         retry_uncaught_errors: Should uncaught errors (unexpected crashes of Claude Code) be retried. Defaults to retrying up to 3 times.
         cwd: Working directory to run claude code within.
@@ -190,8 +209,9 @@ def claude_code(
             checkpointer() as cp,
             sandbox_agent_bridge(
                 state,
-                model=models.bridge_model,
-                model_aliases=models.aliases,
+                model=None if transparent_proxy else models.bridge_model,
+                model_aliases=None if transparent_proxy else models.aliases,
+                forward_generation_config=transparent_proxy,
                 filter=filter,
                 sandbox=sandbox,
                 retry_refusals=retry_refusals,
@@ -240,7 +260,7 @@ def claude_code(
             all_mcp_servers = list(mcp_servers or []) + bridge.mcp_server_configs
             if all_mcp_servers:
                 mcp_server_args, mcp_allowed_tools = resolve_mcp_servers(
-                    all_mcp_servers
+                    all_mcp_servers, allowlist_mcp_tools=allowlist_mcp_tools
                 )
                 cmd.extend(mcp_server_args)
                 cmd_allowed_tools.extend(mcp_allowed_tools)
@@ -505,6 +525,7 @@ async def _seed_claude_config(
 
 def resolve_mcp_servers(
     mcp_servers: Sequence[MCPServerConfig],
+    allowlist_mcp_tools: bool = True,
 ) -> tuple[list[str], list[str]]:
     # build servers and allowed tools
     mcp_servers_json: dict[str, dict[str, Any]] = {}
@@ -523,6 +544,16 @@ def resolve_mcp_servers(
             raise ValueError(
                 f"Unexpected value for mcp server tools: {mcp_server.tools}"
             )
+
+    # Under a permission mode that consults a first-party classifier (e.g.
+    # --permission-mode auto), an MCP allow rule resolves *before* the
+    # classifier and bypasses it, so pre-approved tools are never reviewed.
+    # Callers that want every bridged MCP call adjudicated by the classifier
+    # pass allowlist_mcp_tools=False: the servers are still registered via
+    # --mcp-config (so the tools exist and can be invoked) but no allow-list
+    # entries are emitted (so nothing is pre-approved).
+    if not allowlist_mcp_tools:
+        allowed_tools = []
 
     # map to cli args
     mcp_config_cmds: list[str] = []
