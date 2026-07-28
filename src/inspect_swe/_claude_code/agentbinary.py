@@ -1,13 +1,14 @@
 import re
 from pathlib import Path
 
+from inspect_ai.util import SandboxEnvironment
 from pydantic import BaseModel
 from typing_extensions import Literal
 
 from .._util.agentbinary import AgentBinarySource, AgentBinaryVersion
 from .._util.appdirs import package_cache_dir
 from .._util.download import download_text_file
-from .._util.sandbox import SandboxPlatform
+from .._util.sandbox import SandboxPlatform, sandbox_exec
 
 
 def claude_code_binary_source() -> AgentBinarySource:
@@ -37,6 +38,7 @@ def claude_code_binary_source() -> AgentBinarySource:
         list_cached_binaries=list_cached_binaries,
         post_download=None,
         post_install=None,
+        reported_version=claude_code_binary_version,
     )
 
 
@@ -90,3 +92,14 @@ def _checksum_for_platform(manifest: Manifest, platform: SandboxPlatform) -> str
     if platform not in manifest.platforms:
         raise RuntimeError(f"Platform '{platform}' not found in manifest.")
     return manifest.platforms[platform].checksum
+
+
+async def claude_code_binary_version(
+    sandbox: SandboxEnvironment, binary: str, user: str | None = None
+) -> str | None:
+    try:
+        output = await sandbox_exec(sandbox, f"{binary} --version", user=user)
+    except RuntimeError:
+        return None
+    match = re.search(r"(\d+\.\d+\.\d+)", output)
+    return match.group(1) if match else None

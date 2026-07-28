@@ -1,7 +1,7 @@
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Literal, NamedTuple
+from typing import Awaitable, Callable, Literal, NamedTuple, TypeAlias
 
 from inspect_ai.util import SandboxEnvironment, concurrency
 from inspect_ai.util import sandbox as sandbox_env
@@ -25,6 +25,27 @@ class AgentBinaryVersion(NamedTuple):
     download_url: str
 
 
+AgentBinaryVersionReader: TypeAlias = Callable[
+    [SandboxEnvironment, str, str | None], Awaitable[str | None]
+]
+
+
+class AgentBinaryVersionMismatchError(RuntimeError):
+    agent: str
+    expected: str
+    actual: str | None
+
+    def __init__(self, agent: str, expected: str, actual: str | None) -> None:
+        self.agent = agent
+        self.expected = expected
+        self.actual = actual
+        super().__init__()
+
+    def __str__(self) -> str:
+        actual = self.actual if self.actual is not None else "unavailable"
+        return f"{self.agent} binary version mismatch: expected {self.expected}, got {actual}"
+
+
 @dataclass
 class AgentBinarySource:
     agent: str
@@ -37,6 +58,7 @@ class AgentBinarySource:
     list_cached_binaries: Callable[[], list[Path]]
     post_download: Callable[[bytes], bytes] | None
     post_install: str | None
+    reported_version: AgentBinaryVersionReader
 
 
 # In-process cache for version resolution results. When many samples run
@@ -110,6 +132,13 @@ async def ensure_agent_binary_installed(
         if source.post_install:
             await sandbox_exec(
                 sandbox, f"{binary_path} {source.post_install}", user=user
+            )
+        actual_version = await source.reported_version(sandbox, binary_path, user)
+        if actual_version != resolved_version:
+            raise AgentBinaryVersionMismatchError(
+                agent=source.agent,
+                expected=resolved_version,
+                actual=actual_version,
             )
         return binary_path
 

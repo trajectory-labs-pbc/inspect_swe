@@ -71,6 +71,7 @@ def codex_cli_binary_source() -> AgentBinarySource:
         list_cached_binaries=list_cached_binaries,
         post_download=extract_tarball,
         post_install=None,
+        reported_version=codex_binary_version,
     )
 
 
