@@ -50,10 +50,15 @@ from .agentbinary import (
     codex_models_catalog,
 )
 from .config import (
+    CodexApprovalPolicy,
     CodexDeprecatedArgs,
+    CodexSandboxMode,
     CodexWebSearch,
     codex_cli_config_overrides,
     codex_config_options,
+    codex_mcp_server_toml,
+    codex_sandbox_args,
+    resolve_codex_approval_policy,
     resolve_codex_deprecated_args,
     resolve_codex_web_search,
 )
@@ -85,6 +90,7 @@ def codex_cli(
     attempts: int | AgentAttempts = 1,
     model: str | None = None,
     model_aliases: dict[str, str | Model] | None = None,
+    transparent_proxy: bool = False,
     filter: GenerateFilter | None = None,
     retry_refusals: int | None = None,
     home_dir: str | None = None,
@@ -92,6 +98,9 @@ def codex_cli(
     env: dict[str, str] | None = None,
     user: str | None = None,
     sandbox: str | None = None,
+    sandbox_mode: CodexSandboxMode = "danger-full-access",
+    approval_policy: CodexApprovalPolicy = "never",
+    network_access: bool = True,
     version: Literal["auto", "sandbox", "latest"] | str = "auto",
     config_overrides: dict[str, str] | None = None,
     debug: bool | None = None,
@@ -125,6 +134,16 @@ def codex_cli(
         model_aliases: Optional mapping of model names to Model instances or model name strings.
             Allows using custom Model implementations (e.g., wrapped Agents) instead of standard models.
             When a model name in the mapping is referenced, the corresponding Model/string is used.
+        transparent_proxy: Run the bridge as a faithful transparent proxy (defaults
+            to `False`). When `True`, each request is routed to the model the agent
+            actually asked for -- no alias table and no fallback collapse onto the
+            session model -- and the client's generation parameters are treated as
+            authoritative. Required when the agent makes internal model calls of its
+            own that must reach their real provider model rather than being served by
+            the session model, e.g. Codex's `auto_review` reviewer (`codex-auto-review`)
+            under `approval_policy="on-request"`. With the default `False`, such a
+            request falls through to the fallback model, so the reviewer is silently
+            served by the session model instead of OpenAI's reviewer.
         filter: Filter for intercepting bridged model requests.
         retry_refusals: Should refusals be retried? (pass number of times to retry)
         home_dir: Home directory to use for codex cli. If set, AGENTS.md, skills, and the MCP configuration will be written here.
@@ -132,6 +151,25 @@ def codex_cli(
         env: Environment variables to set for codex cli
         user: User to execute codex cli with.
         sandbox: Optional sandbox environment name.
+        sandbox_mode: Codex's own sandbox policy for model-generated shell commands
+            (`-s`/`--sandbox`), not related to the `sandbox` option above that selects
+            an Inspect sandbox environment. Defaults to `"danger-full-access"`, which
+            combined with `approval_policy="never"` (the default) reproduces the
+            original `--dangerously-bypass-approvals-and-sandbox` behavior. Passing
+            `"workspace-write"` or `"read-only"` runs Codex's own Linux sandbox
+            (bubblewrap); this requires the sandbox environment to allow unprivileged
+            user namespace creation. The policy applies only to model-generated shell
+            commands: the Codex parent process contacts MCP servers and the model proxy
+            outside that sandbox. With the default `approval_policy="never"`, a
+            `"read-only"` sandbox denies writes outright because no approval path is
+            available.
+        approval_policy: Codex's approval policy (`AskForApproval`). Defaults to
+            `"never"` (commands are never escalated to interactive approval --
+            required for headless `codex exec`, which cannot answer approval
+            prompts). `-a`/`--ask-for-approval` is not accepted by `codex exec`, so
+            this is applied via `-c approval_policy=<value>`.
+        network_access: Whether Codex's `"workspace-write"` sandbox may access the
+            network. Defaults to `True`; ignored by other sandbox modes.
         version: Version of codex cli to use. One of:
             - "auto": Use any available version of codex cli in the sandbox, otherwise download the latest version.
             - "sandbox": Use the version of codex cli in the sandbox (raises `RuntimeError` if codex is not available in the sandbox)
@@ -160,6 +198,9 @@ def codex_cli(
         cast(dict[str, Any], deprecated_args)
     )
     effective_web_search = resolve_codex_web_search(web_search, disallowed_tools)
+    effective_approval_policy = resolve_codex_approval_policy(
+        approval_policy, config_overrides
+    )
 
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
@@ -179,8 +220,9 @@ def codex_cli(
             checkpointer() as cp,
             sandbox_agent_bridge(
                 state,
-                model=bridge_model,
-                model_aliases=model_aliases,
+                model=None if transparent_proxy else bridge_model,
+                model_aliases=None if transparent_proxy else model_aliases,
+                forward_generation_config=transparent_proxy,
                 filter=filter,
                 sandbox=sandbox,
                 retry_refusals=retry_refusals,
@@ -270,14 +312,20 @@ def codex_cli(
                     # selects Codex's system prompt + tool set (see codex_model above)
                     "--model",
                     codex_model,
-                    "--dangerously-bypass-approvals-and-sandbox",
                 ]
+            )
+
+            cmd.extend(
+                codex_sandbox_args(
+                    sandbox_mode, effective_approval_policy, network_access
+                )
             )
 
             # apply config overrides
             if config_overrides:
                 for key, value in config_overrides.items():
-                    cmd.extend(["-c", f"{key}={value}"])
+                    if key != "approval_policy":
+                        cmd.extend(["-c", f"{key}={value}"])
 
             # apply final Codex config overrides for explicit arguments
             for key, value in codex_cli_config_overrides(
@@ -293,15 +341,17 @@ def codex_cli(
             toml_config["analytics"] = {"enabled": False}
             toml_config.update(codex_config_options(effective_web_search, goals))
 
-            # register mcp servers (combine static configs with bridged tools)
-            all_mcp_servers = list(mcp_servers or []) + bridge.mcp_server_configs
-            if all_mcp_servers:
-                for mcp_server in all_mcp_servers:
-                    toml_config[f"mcp_servers.{mcp_server.name}"] = (
-                        mcp_server.model_dump(
-                            exclude={"name", "tools"}, exclude_none=True
-                        )
-                    )
+            # Register static MCP servers unchanged. Bridged tools are supplied by the
+            # evaluation author, so headless approval can safely skip their MCP gate.
+            for mcp_server in mcp_servers or []:
+                toml_config[f"mcp_servers.{mcp_server.name}"] = mcp_server.model_dump(
+                    exclude={"name", "tools"}, exclude_none=True
+                )
+            for mcp_server in bridge.mcp_server_configs:
+                toml_config[f"mcp_servers.{mcp_server.name}"] = codex_mcp_server_toml(
+                    mcp_server.model_dump(exclude={"name", "tools"}, exclude_none=True),
+                    effective_approval_policy,
+                )
 
             # model provider (use a custom provider name so we can set
             # stream_idle_timeout_ms -- built-in providers can't be overridden)
