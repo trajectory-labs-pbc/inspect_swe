@@ -59,19 +59,35 @@ def test_codex_cli_config_overrides_format_values_for_cli() -> None:
 
 
 def test_codex_mcp_server_toml_sets_approve_when_never() -> None:
+    from inspect_swe._codex_cli.config import MCP_STARTUP_TIMEOUT_SEC
+
     dump = {"type": "http", "url": "http://localhost:8901/mcp/taiga-mcp"}
     result = codex_mcp_server_toml(dump, "never")
+    # startup_timeout_sec is expected in EVERY table: codex's own default is
+    # short enough that a slow sandboxed server is abandoned and the agent runs
+    # with no tools, silently scored. See codex_mcp_server_toml.
     assert result == {
         "type": "http",
         "url": "http://localhost:8901/mcp/taiga-mcp",
         "default_tools_approval_mode": "approve",
+        "startup_timeout_sec": MCP_STARTUP_TIMEOUT_SEC,
     }
 
 
 def test_codex_mcp_server_toml_leaves_other_policies_untouched() -> None:
+    """A prompting policy keeps the per-server approval default.
+
+    The startup timeout is NOT policy-dependent -- a slow server is abandoned
+    regardless of how tool calls get approved -- so it is expected here too.
+    """
+    from inspect_swe._codex_cli.config import MCP_STARTUP_TIMEOUT_SEC
+
     dump = {"type": "http", "url": "http://localhost:8901/mcp/taiga-mcp"}
     for policy in ("untrusted", "on-request"):
-        assert codex_mcp_server_toml(dump, policy) == dump
+        assert codex_mcp_server_toml(dump, policy) == {
+            **dump,
+            "startup_timeout_sec": MCP_STARTUP_TIMEOUT_SEC,
+        }
 
 
 def test_codex_mcp_server_toml_does_not_mutate_input() -> None:
@@ -129,3 +145,31 @@ def test_config_override_resolves_effective_approval_policy() -> None:
 def test_config_override_rejects_unknown_approval_policy() -> None:
     with pytest.raises(ValueError, match="approval_policy"):
         resolve_codex_approval_policy("never", {"approval_policy": "always"})
+
+
+def test_bridged_mcp_servers_get_a_generous_startup_timeout() -> None:
+    """Codex must not give up on a slow-starting MCP server and run toolless.
+
+    Codex awaits its MCP tool list at session start, but the wait is bounded by a
+    per-server `startup_timeout_sec`. Nothing set it, so codex used its built-in
+    default; when a sandboxed server took longer, codex proceeded with the server
+    FAILED and the agent had no environment tools. It then did nothing and the
+    empty trajectory was SCORED with no error to retry on -- 2.40% of 250 samples
+    at 150-way concurrency, and 87/4130 across a production collection.
+    """
+    from inspect_swe._codex_cli.config import (
+        MCP_STARTUP_TIMEOUT_SEC,
+        codex_mcp_server_toml,
+    )
+
+    assert MCP_STARTUP_TIMEOUT_SEC >= 120, (
+        "startup timeout must exceed realistic sandboxed MCP startup time, or "
+        "codex silently runs the agent with no environment tools"
+    )
+    table = codex_mcp_server_toml({"url": "http://localhost:1/mcp/x"}, "never")
+    assert table["startup_timeout_sec"] == MCP_STARTUP_TIMEOUT_SEC
+    # an explicit author value must win
+    explicit = codex_mcp_server_toml(
+        {"url": "http://localhost:1/mcp/x", "startup_timeout_sec": 7}, "never"
+    )
+    assert explicit["startup_timeout_sec"] == 7

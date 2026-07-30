@@ -55,6 +55,13 @@ def codex_cli_config_overrides(
     }
 
 
+# Seconds codex waits for an MCP server to come up before giving up on it and
+# running the agent with no tools. Codex's own default sits far below the startup
+# time of a sandboxed server on a loaded host, and exceeding it fails SILENTLY
+# (see codex_mcp_server_toml).
+MCP_STARTUP_TIMEOUT_SEC = 300
+
+
 def codex_mcp_server_toml(
     mcp_server_dump: dict[str, Any], approval_policy: CodexApprovalPolicy
 ) -> dict[str, Any]:
@@ -74,6 +81,24 @@ def codex_mcp_server_toml(
     mcp_server_toml = dict(mcp_server_dump)
     if approval_policy == "never":
         mcp_server_toml["default_tools_approval_mode"] = "approve"
+    # Codex awaits its MCP tool list at session start (its binary carries
+    # `session_init.required_mcp_wait` and "waiting for MCP server tools while
+    # building tool list") rather than starting with a pending server -- but that
+    # wait is bounded by this per-server key, which nothing set, so codex ran on
+    # its built-in default. When a sandboxed server takes longer than that to come
+    # up, codex proceeds with the server FAILED and the agent has NO environment
+    # tools. It then does nothing, and the empty trajectory is SCORED: no error is
+    # set, so `--retry-on-error` never fires and it lands in the corpus as a
+    # legitimate 0.0.
+    #
+    # Measured on 250 samples at 150-way concurrency on a slow sandbox backend:
+    # 6 (2.40%) never referenced an environment tool in ANY exec script and made
+    # ZERO exec calls, every one graded 0.0/0.0. Consistent with 87/4130 (2.11%)
+    # across a 4500-sample production collection, so it reproduces on demand.
+    #
+    # setdefault so an explicit author value still wins. Raising a startup budget
+    # cannot change behavior for a server that was already starting in time.
+    mcp_server_toml.setdefault("startup_timeout_sec", MCP_STARTUP_TIMEOUT_SEC)
     return mcp_server_toml
 
 
