@@ -2,7 +2,7 @@ import shlex
 import uuid
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Mapping, Sequence, cast
 
 from inspect_ai.agent import (
     Agent,
@@ -15,7 +15,13 @@ from inspect_ai.agent import (
 )
 from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model, StopReason
 from inspect_ai.scorer import score
-from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
+from inspect_ai.tool import (
+    MCPServerConfig,
+    MCPServerConfigHTTP,
+    Skill,
+    install_skills,
+    read_skills,
+)
 from inspect_ai.util import (
     ExecRemoteStreamingOptions,
     StoreModel,
@@ -28,6 +34,7 @@ from inspect_ai.util import (
 )
 from pydantic import Field
 from pydantic_core import to_json
+from typing_extensions import TypedDict, Unpack
 
 from inspect_swe._claude_code._events.live_consumer import LiveConsumer
 from inspect_swe._claude_code._events.stream import (
@@ -38,6 +45,7 @@ from inspect_swe._claude_code._events.stream import (
     claude_code_event_stream,
 )
 from inspect_swe._util.centaur import CentaurOptions, run_centaur
+from inspect_swe._util.mcp_ready import wait_for_mcp_endpoints
 from inspect_swe._util.path import join_path
 
 from .._util._async import is_callable_coroutine
@@ -47,6 +55,55 @@ from .._util.sandbox import resolve_agent_cwd
 from .._util.trace import trace
 from .agentbinary import claude_code_binary_source
 from .model import resolve_claude_code_models
+
+ClaudeCodePermissionMode = Literal[
+    "acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"
+]
+
+
+class ClaudeCodeDeprecatedArgs(TypedDict, total=False):
+    auto_mode: bool
+
+
+def resolve_claude_code_deprecated_args(
+    deprecated_args: Mapping[str, Any],
+    permission_mode: str | None,
+) -> ClaudeCodePermissionMode | None:
+    unexpected_args = set(deprecated_args) - {"auto_mode"}
+    if unexpected_args:
+        unexpected = ", ".join(sorted(unexpected_args))
+        raise TypeError(f"Unexpected keyword argument(s): {unexpected}")
+
+    auto_mode = deprecated_args.get("auto_mode")
+    if auto_mode:
+        if permission_mode is not None and permission_mode != "auto":
+            raise ValueError(
+                "auto_mode=True conflicts with permission_mode; use permission_mode='auto'."
+            )
+        return "auto"
+    return resolve_claude_code_permission_mode(permission_mode)
+
+
+def resolve_claude_code_permission_mode(
+    permission_mode: str | None,
+) -> ClaudeCodePermissionMode | None:
+    match permission_mode:
+        case None:
+            return None
+        case (
+            "acceptEdits"
+            | "auto"
+            | "bypassPermissions"
+            | "default"
+            | "dontAsk"
+            | "plan"
+        ):
+            return permission_mode
+        case _:
+            raise ValueError(
+                "permission_mode must be one of 'acceptEdits', 'auto', "
+                "'bypassPermissions', 'default', 'dontAsk', or 'plan'."
+            )
 
 
 @agent
@@ -66,12 +123,13 @@ def claude_code(
     model: str | None = None,
     model_config: str | None = None,
     model_aliases: dict[str, str | Model] | None = None,
+    transparent_proxy: bool = False,
     opus_model: str | None = None,
     sonnet_model: str | None = None,
     haiku_model: str | None = None,
     subagent_model: str | None = None,
     filter: GenerateFilter | None = None,
-    auto_mode: bool = False,
+    permission_mode: ClaudeCodePermissionMode | None = None,
     retry_refusals: int | None = 3,
     retry_uncaught_errors: int | None = 3,
     cwd: str | None = None,
@@ -80,6 +138,8 @@ def claude_code(
     sandbox: str | None = None,
     version: Literal["auto", "sandbox", "stable", "latest"] | str = "auto",
     debug: bool | None = None,
+    allowlist_mcp_tools: bool = True,
+    **deprecated_args: Unpack[ClaudeCodeDeprecatedArgs],
 ) -> Agent:
     """Claude Code agent.
 
@@ -116,12 +176,31 @@ def claude_code(
         model_aliases: Optional mapping of model names to Model instances or model name strings.
             Allows using custom Model implementations (e.g., wrapped Agents) instead of standard models.
             When a model name in the mapping is referenced, the corresponding Model/string is used.
+        transparent_proxy: Run the bridge as a faithful transparent proxy (defaults
+            to `False`). When `True`, each request is routed to the model the agent
+            actually asked for -- no alias table and no fallback collapse onto the
+            session model -- and the client's generation parameters are treated as
+            authoritative. Required when the agent makes internal model calls of its
+            own that must reach their real provider model rather than being served by
+            the session model, e.g. Claude Code's auto-mode security classifier under
+            `auto_mode=True`. With the default `False`, the presented-identity aliases
+            and the fallback model collapse such a request onto the session model, so
+            the classifier is served by the wrong model (and its generation parameters,
+            e.g. `max_tokens`, are dropped).
         opus_model: The model to use for `opus`, or for `opusplan` when Plan Mode is active. Defaults to `model`.
         sonnet_model: The model to use for `sonnet`, or for `opusplan` when Plan Mode is not active. Defaults to `model`.
         haiku_model: The model to use for haiku, or [background functionality](https://code.claude.com/docs/en/costs#background-token-usage). Defaults to `model`.
         subagent_model: The model to use for [subagents](https://code.claude.com/docs/en/sub-agents). Defaults to `model`.
         filter: Filter for intercepting bridged model requests.
-        auto_mode: Use `auto` permission mode rather than `--dangerously-skip-permissions`. Note that this can result in rejected tool calls so only enable if your evaluation can tolerate this.
+        permission_mode: Claude Code `--permission-mode`. The complete CLI set is
+            `"acceptEdits"`, `"auto"`, `"bypassPermissions"`, `"default"`,
+            `"dontAsk"`, and `"plan"`. `"bypassPermissions"` is near-equivalent
+            to the default `--dangerously-skip-permissions` path, and `"dontAsk"`
+            is also now reachable. `--allowed-tools` is consulted in every mode
+            except `"bypassPermissions"`. In unattended runs, tools excluded from
+            `--allowed-tools` cannot be prompted for and are denied; `"auto"` is
+            the only mode where otherwise-unapproved calls are adjudicated by
+            Claude Code's first-party classifier rather than denied unconditionally.
         retry_refusals: Should refusals be retried? Defaults to retrying up to 3 times.
         retry_uncaught_errors: Should uncaught errors (unexpected crashes of Claude Code) be retried. Defaults to retrying up to 3 times.
         cwd: Working directory to run claude code within.
@@ -135,6 +214,15 @@ def claude_code(
             - "latest": Download and use the very latest version of claude code.
             - "x.x.x": Download and use a specific version of claude code.
         debug: Add `--debug` cli flag and trace all debug output.
+        allowlist_mcp_tools: Whether to add static caller-provided MCP tools to
+            `--allowed-tools` (default `True`). It matters in every permission
+            mode except `"bypassPermissions"`: in unattended runs, excluded
+            static tools are denied without prompting. Set `False` with
+            `permission_mode="auto"` when Claude Code's first-party classifier
+            should adjudicate those tools. Bridged Inspect tools remain allowlisted
+            because an evaluation may depend on them being callable.
+        **deprecated_args: Supports the deprecated `auto_mode` argument. Set
+            `auto_mode=True` maps to `permission_mode="auto"`.
     """
     # resolve centaur
     if centaur is True:
@@ -145,6 +233,10 @@ def claude_code(
 
     # resolve attempts
     attempts = AgentAttempts(attempts) if isinstance(attempts, int) else attempts
+
+    effective_permission_mode = resolve_claude_code_deprecated_args(
+        cast(dict[str, Any], deprecated_args), permission_mode
+    )
 
     # allocate session_id once per agent instance so that all calls to execute()
     # for the same sample share the same session. this enables --resume <id> to
@@ -185,8 +277,9 @@ def claude_code(
             checkpointer() as cp,
             sandbox_agent_bridge(
                 state,
-                model=models.bridge_model,
-                model_aliases=models.aliases,
+                model=None if transparent_proxy else models.bridge_model,
+                model_aliases=None if transparent_proxy else models.aliases,
+                forward_generation_config=transparent_proxy,
                 filter=filter,
                 sandbox=sandbox,
                 retry_refusals=retry_refusals,
@@ -211,11 +304,9 @@ def claude_code(
                 claude_code_binary_source(), version, user, sandbox_env(sandbox)
             )
 
-            # base options — auto_mode uses --permission-mode auto (monitor active);
-            # otherwise --dangerously-skip-permissions (no permission gating).
             permission_flag = (
-                ["--permission-mode", "auto"]
-                if auto_mode
+                ["--permission-mode", effective_permission_mode]
+                if effective_permission_mode is not None
                 else ["--dangerously-skip-permissions"]
             )
             cmd = [
@@ -230,15 +321,27 @@ def claude_code(
                 if debug:
                     cmd.append("--debug")
 
-            # mcp servers (combine static configs with bridged tools)
             cmd_allowed_tools: list[str] = []
-            all_mcp_servers = list(mcp_servers or []) + bridge.mcp_server_configs
+            static_mcp_servers = list(mcp_servers or [])
+            bridged_mcp_servers = bridge.mcp_server_configs
+            all_mcp_servers = static_mcp_servers + bridged_mcp_servers
+            # HTTP endpoints we must confirm are live before EVERY launch: the
+            # bridge proxy starts asynchronously, and Claude Code reads
+            # --mcp-config at startup. If the proxy isn't listening yet the
+            # agent comes up with no MCP tools and reports NO error.
+            http_mcp_configs = [
+                c for c in all_mcp_servers if isinstance(c, MCPServerConfigHTTP)
+            ]
             if all_mcp_servers:
-                mcp_server_args, mcp_allowed_tools = resolve_mcp_servers(
-                    all_mcp_servers
-                )
+                mcp_server_args, _ = resolve_mcp_servers(all_mcp_servers)
                 cmd.extend(mcp_server_args)
-                cmd_allowed_tools.extend(mcp_allowed_tools)
+                cmd_allowed_tools.extend(
+                    resolve_allowed_mcp_tools(
+                        static_mcp_servers,
+                        bridged_mcp_servers,
+                        allowlist_mcp_tools,
+                    )
+                )
 
             # add allowed and disallowed tools
             if len(cmd_allowed_tools) > 0:
@@ -354,6 +457,19 @@ def claude_code(
                         # left open (e.g. Claude exited mid-Task before the
                         # tool_result), so SpanBegin/End stay balanced.
                         consumer.reset()
+
+                        # Wait for bridge MCP endpoints before (re)launching.
+                        # This loop restarts the Claude Code subprocess with
+                        # --resume; the proxy may not be reachable yet, and a
+                        # resumed session that starts without its MCP tools
+                        # fails SILENTLY -- the agent just sees "No such tool
+                        # available" and its output gets graded as a normal
+                        # (toolless) sample. Raises if unreachable so the
+                        # sample errors instead of being scored.
+                        if http_mcp_configs:
+                            await wait_for_mcp_endpoints(
+                                http_mcp_configs, bridge, required=True
+                            )
 
                         # launch Claude Code in streaming mode; drain stdout in
                         # real time so the consumer emits agent spans and the
@@ -503,21 +619,10 @@ def resolve_mcp_servers(
 ) -> tuple[list[str], list[str]]:
     # build servers and allowed tools
     mcp_servers_json: dict[str, dict[str, Any]] = {}
-    allowed_tools: list[str] = []
     for mcp_server in mcp_servers:
         mcp_servers_json[mcp_server.name] = mcp_server.model_dump(
             exclude={"name", "tools"}, exclude_none=True
         )
-        if mcp_server.tools == "all":
-            allowed_tools.append(f"mcp__{mcp_server.name}_*")
-        elif isinstance(mcp_server.tools, list):
-            allowed_tools.extend(
-                [f"mcp__{mcp_server.name}__{tool}" for tool in mcp_server.tools]
-            )
-        else:
-            raise ValueError(
-                f"Unexpected value for mcp server tools: {mcp_server.tools}"
-            )
 
     # map to cli args
     mcp_config_cmds: list[str] = []
@@ -527,7 +632,39 @@ def resolve_mcp_servers(
             to_json({"mcpServers": mcp_servers_json}, exclude_none=True).decode()
         )
 
-    return mcp_config_cmds, allowed_tools
+    return mcp_config_cmds, resolve_mcp_server_allowed_tools(mcp_servers)
+
+
+def resolve_allowed_mcp_tools(
+    static_mcp_servers: Sequence[MCPServerConfig],
+    bridged_mcp_servers: Sequence[MCPServerConfig],
+    allowlist_mcp_tools: bool,
+) -> list[str]:
+    static_allowed_tools = (
+        resolve_mcp_server_allowed_tools(static_mcp_servers)
+        if allowlist_mcp_tools
+        else []
+    )
+    bridged_allowed_tools = resolve_mcp_server_allowed_tools(bridged_mcp_servers)
+    return [*static_allowed_tools, *bridged_allowed_tools]
+
+
+def resolve_mcp_server_allowed_tools(
+    mcp_servers: Sequence[MCPServerConfig],
+) -> list[str]:
+    allowed_tools: list[str] = []
+    for mcp_server in mcp_servers:
+        if mcp_server.tools == "all":
+            allowed_tools.append(f"mcp__{mcp_server.name}__*")
+        elif isinstance(mcp_server.tools, list):
+            allowed_tools.extend(
+                [f"mcp__{mcp_server.name}__{tool}" for tool in mcp_server.tools]
+            )
+        else:
+            raise ValueError(
+                f"Unexpected value for mcp server tools: {mcp_server.tools}"
+            )
+    return allowed_tools
 
 
 async def run_claude_code_centaur(
