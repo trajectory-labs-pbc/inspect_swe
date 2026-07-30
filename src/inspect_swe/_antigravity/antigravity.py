@@ -23,8 +23,7 @@ from inspect_ai.model import (
     Model,
     ModelOutput,
 )
-from inspect_ai.tool import ToolChoice, ToolInfo
-from inspect_ai.tool import MCPServerConfig
+from inspect_ai.tool import MCPServerConfig, ToolChoice, ToolInfo
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.util import sandbox as sandbox_env
 from inspect_ai.util import store
@@ -74,7 +73,13 @@ _SANDBOX_DUMMY_API_KEY: Final = "inspect-bridge-unused"
 # allow-list before it reaches the model (the analog of the claude_code/codex CLIs'
 # --disallowed-tools), via Inspect's GenerateFilter hook. Agent-scoped; no change
 # to the shared bridge.
-_ALLOWED_TOOL_NAMES: Final = frozenset({"call_mcp_tool"})
+#
+# view_file is allow-listed alongside call_mcp_tool because localharness offloads
+# any large MCP tool result to a file and returns the model only a file:// pointer
+# ("The output was large and was saved to: ..."). Without a read-back path the
+# offloaded payload is unrecoverable, so tool observations above localharness's
+# internal cap (~4KB) never reach the model. view_file is that read-back path.
+_ALLOWED_TOOL_NAMES: Final = frozenset({"call_mcp_tool", "view_file"})
 
 
 def _confine_declared_tools(user_filter: GenerateFilter | None) -> GenerateFilter:

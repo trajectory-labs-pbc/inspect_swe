@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import posixpath
 from pathlib import Path
 from typing import Any, ClassVar, Final, Literal, TypedDict
 
@@ -71,6 +72,20 @@ def build_config(payload: RunnerPayload) -> LocalAgentConfig:
     def _targets_configured_server(args: dict[str, Any]) -> bool:
         return args.get("ServerName") == payload["mcp_name"]
 
+    # view_file exists ONLY to read back localharness's offloaded tool results,
+    # which live under the agent's own app_data_dir (/home/model/.antigravity).
+    # Confine it there so it cannot read task files, the workspace, or grading
+    # ground truth elsewhere in the sandbox. Paths are normalized first so ``..``
+    # traversal cannot escape the prefix.
+    _app_data_dir = posixpath.normpath(payload["app_data_dir"])
+
+    def _within_app_data_dir(args: dict[str, Any]) -> bool:
+        raw = args.get("AbsolutePath")
+        if not isinstance(raw, str) or not raw:
+            return False
+        resolved = posixpath.normpath(raw)
+        return resolved == _app_data_dir or resolved.startswith(_app_data_dir + "/")
+
     # Setting base_url makes GeminiAPIEndpoint.validate_endpoint() short-circuit
     # the real-key requirement; the placeholder api_key rides the localharness
     # proto but the bridge never checks it (sandbox egress is network_mode:none).
@@ -86,13 +101,19 @@ def build_config(payload: RunnerPayload) -> LocalAgentConfig:
         models=[bridge_model],
         system_instructions=payload["system_instructions"],
         capabilities=types.CapabilitiesConfig(
-            enabled_tools=[],
+            # VIEW_FILE is the one builtin the model needs to read back a large MCP
+            # tool result that localharness has offloaded to a file (see
+            # _ALLOWED_TOOL_NAMES in antigravity.py). With an empty allowlist the
+            # offloaded payload is unreadable and any tool observation above
+            # localharness's internal cap is silently lost to the model.
+            enabled_tools=[types.BuiltinTools.VIEW_FILE],
             enable_subagents=False,
         ),
         mcp_servers=[mcp_server],
         policies=[
             policy.deny_all(),
             policy.allow("call_mcp_tool", when=_targets_configured_server),
+            policy.allow(types.BuiltinTools.VIEW_FILE.value, when=_within_app_data_dir),
             *policy.allow(mcp_server),
         ],
         workspaces=[],
