@@ -124,6 +124,7 @@ def claude_code(
     model: str | None = None,
     model_config: str | None = None,
     model_aliases: dict[str, str | Model] | None = None,
+    transparent_proxy: bool = False,
     opus_model: str | None = None,
     sonnet_model: str | None = None,
     haiku_model: str | None = None,
@@ -138,7 +139,9 @@ def claude_code(
     sandbox: str | None = None,
     version: Literal["auto", "sandbox", "stable", "latest"] | str = "auto",
     debug: bool | None = None,
+    replace_system_prompt: str | None = None,
     allowlist_mcp_tools: bool = True,
+    allowlist_bridged_tools: bool = True,
     **deprecated_args: Unpack[ClaudeCodeDeprecatedArgs],
 ) -> Agent:
     """Claude Code agent.
@@ -155,7 +158,10 @@ def claude_code(
     Args:
         name: Agent name (used in multi-agent systems with `as_tool()` and `handoff()`)
         description: Agent description (used in multi-agent systems with `as_tool()` and `handoff()`)
-        system_prompt: Additional system prompt to append to default system prompt.
+        system_prompt: Additional instructions to append to Claude Code's built-in
+            system prompt.
+        replace_system_prompt: System prompt that replaces Claude Code's built-in
+            system prompt. Cannot be combined with `system_prompt`.
         skills: Additional [skills](https://inspect.aisi.org.uk/tools-standard.html#sec-skill) to make available to the agent.
         mcp_servers: MCP servers to make available to the agent.
         bridged_tools: Host-side Inspect tools to expose to the agent via MCP.
@@ -176,6 +182,17 @@ def claude_code(
         model_aliases: Optional mapping of model names to Model instances or model name strings.
             Allows using custom Model implementations (e.g., wrapped Agents) instead of standard models.
             When a model name in the mapping is referenced, the corresponding Model/string is used.
+        transparent_proxy: Run the bridge as a faithful transparent proxy (defaults
+            to `False`). When `True`, each request is routed to the model the agent
+            actually asked for -- no alias table and no fallback collapse onto the
+            session model -- and the client's generation parameters are treated as
+            authoritative. Required when the agent makes internal model calls of its
+            own that must reach their real provider model rather than being served by
+            the session model, e.g. Claude Code's auto-mode security classifier under
+            `auto_mode=True`. With the default `False`, the presented-identity aliases
+            and the fallback model collapse such a request onto the session model, so
+            the classifier is served by the wrong model (and its generation parameters,
+            e.g. `max_tokens`, are dropped).
         opus_model: The model to use for `opus`, or for `opusplan` when Plan Mode is active. Defaults to `model`.
         sonnet_model: The model to use for `sonnet`, or for `opusplan` when Plan Mode is not active. Defaults to `model`.
         haiku_model: The model to use for haiku, or [background functionality](https://code.claude.com/docs/en/costs#background-token-usage). Defaults to `model`.
@@ -208,11 +225,31 @@ def claude_code(
             mode except `"bypassPermissions"`: in unattended runs, excluded
             static tools are denied without prompting. Set `False` with
             `permission_mode="auto"` when Claude Code's first-party classifier
-            should adjudicate those tools. Bridged Inspect tools remain allowlisted
-            because an evaluation may depend on them being callable.
+            should adjudicate those tools. Bridged Inspect tools are governed
+            separately by `allowlist_bridged_tools`.
+        allowlist_bridged_tools: Whether to add bridged Inspect tools to
+            `--allowed-tools` (default `True`, preserving the behavior every
+            existing caller gets). Bridged tools are allowlisted by default
+            because an evaluation may depend on them being callable, and in
+            every mode except `"auto"` a tool left off `--allowed-tools` is
+            denied without prompting in an unattended run.
+
+            Set `False` ONLY with `permission_mode="auto"`, where an excluded
+            tool is adjudicated by the classifier rather than denied. This is
+            required for an evaluation that measures Claude Code's own auto-mode
+            classifier acting on bridged tools: an allow rule resolves at step 1
+            of the permission flow, BEFORE the classifier, so an allowlisted
+            bridged call is never reviewed. Left `True` under `"auto"`, a run
+            whose entire tool surface is bridged produces ZERO adjudications and
+            looks clean while being wholly unreviewed.
         **deprecated_args: Supports the deprecated `auto_mode` argument. Set
             `auto_mode=True` maps to `permission_mode="auto"`.
     """
+    if system_prompt is not None and replace_system_prompt is not None:
+        raise ValueError(
+            "system_prompt and replace_system_prompt cannot both be specified"
+        )
+
     # resolve centaur
     if centaur is True:
         centaur = CentaurOptions()
@@ -266,8 +303,9 @@ def claude_code(
             checkpointer() as cp,
             sandbox_agent_bridge(
                 state,
-                model=models.bridge_model,
-                model_aliases=models.aliases,
+                model=None if transparent_proxy else models.bridge_model,
+                model_aliases=None if transparent_proxy else models.aliases,
+                forward_generation_config=transparent_proxy,
                 filter=filter,
                 sandbox=sandbox,
                 retry_refusals=retry_refusals,
@@ -331,6 +369,7 @@ def claude_code(
                         static_mcp_servers,
                         bridged_mcp_servers,
                         allowlist_mcp_tools,
+                        allowlist_bridged_tools,
                     )
                 )
 
@@ -393,28 +432,22 @@ def claude_code(
                             or cp.attempt == "resume"
                         )
 
-                        # System prompt is sent only when creating the session.
-                        # On resume the session already contains system messages, so send
-                        # nothing: the bridge round-trips Claude Code's own
-                        # system prompt back into state.messages as a
-                        # ChatMessageSystem, and re-passing it via
-                        # --append-system-prompt would duplicate the entire
-                        # system prompt on every resumed turn (the flag is
-                        # applied per-invocation, not persisted anyway).
-                        system_args: list[str] = []
-                        if not is_resume:
-                            system_texts = [
-                                m.text
-                                for m in state.messages
-                                if isinstance(m, ChatMessageSystem)
-                            ]
-                            if system_prompt is not None:
-                                system_texts.append(system_prompt)
-                            if system_texts:
-                                system_args = [
-                                    "--append-system-prompt",
-                                    "\n\n".join(system_texts),
-                                ]
+                        # Replacement flags are per-invocation, so re-send them on
+                        # resume. Appended messages are not re-sent because the bridge
+                        # round-trips them into state.messages and appending them again
+                        # would duplicate the effective prompt.
+                        system_texts = [
+                            m.text
+                            for m in state.messages
+                            if isinstance(m, ChatMessageSystem)
+                        ]
+                        if system_prompt is not None:
+                            system_texts.append(system_prompt)
+                        system_args = _system_prompt_args(
+                            system_texts,
+                            replace_system_prompt,
+                            is_resume=is_resume,
+                        )
 
                         # resume previous conversation
                         if is_resume:
@@ -569,6 +602,21 @@ def claude_code(
     return agent_with(execute, name=name, description=description)
 
 
+def _system_prompt_args(
+    system_texts: Sequence[str],
+    replace_system_prompt: str | None,
+    *,
+    is_resume: bool,
+) -> list[str]:
+    args: list[str] = []
+    if replace_system_prompt is not None:
+        args.extend(["--system-prompt", replace_system_prompt])
+    if system_texts and not is_resume:
+        args.extend(["--append-system-prompt", "\n\n".join(system_texts)])
+
+    return args
+
+
 async def _seed_claude_config(
     sbox: Any,
     api_key: str,
@@ -620,13 +668,18 @@ def resolve_allowed_mcp_tools(
     static_mcp_servers: Sequence[MCPServerConfig],
     bridged_mcp_servers: Sequence[MCPServerConfig],
     allowlist_mcp_tools: bool,
+    allowlist_bridged_tools: bool = True,
 ) -> list[str]:
     static_allowed_tools = (
         resolve_mcp_server_allowed_tools(static_mcp_servers)
         if allowlist_mcp_tools
         else []
     )
-    bridged_allowed_tools = resolve_mcp_server_allowed_tools(bridged_mcp_servers)
+    bridged_allowed_tools = (
+        resolve_mcp_server_allowed_tools(bridged_mcp_servers)
+        if allowlist_bridged_tools
+        else []
+    )
     return [*static_allowed_tools, *bridged_allowed_tools]
 
 

@@ -50,10 +50,19 @@ from .agentbinary import (
     codex_models_catalog,
 )
 from .config import (
+    CodexApprovalPolicy,
+    CodexAutoReview,
     CodexDeprecatedArgs,
+    CodexSandboxMode,
     CodexWebSearch,
+    check_codex_auto_review_version,
     codex_cli_config_overrides,
     codex_config_options,
+    codex_mcp_server_toml,
+    codex_sandbox_args,
+    resolve_codex_approval_policy,
+    resolve_codex_auto_review,
+    resolve_codex_auto_review_model_aliases,
     resolve_codex_deprecated_args,
     resolve_codex_web_search,
 )
@@ -81,10 +90,12 @@ def codex_cli(
     bridged_tools: Sequence[BridgedToolsSpec] | None = None,
     web_search: CodexWebSearch = "live",
     goals: bool = True,
+    auto_review: bool | CodexAutoReview = False,
     centaur: bool | CentaurOptions = False,
     attempts: int | AgentAttempts = 1,
     model: str | None = None,
     model_aliases: dict[str, str | Model] | None = None,
+    transparent_proxy: bool = False,
     filter: GenerateFilter | None = None,
     retry_refusals: int | None = None,
     home_dir: str | None = None,
@@ -92,6 +103,9 @@ def codex_cli(
     env: dict[str, str] | None = None,
     user: str | None = None,
     sandbox: str | None = None,
+    sandbox_mode: CodexSandboxMode = "danger-full-access",
+    approval_policy: CodexApprovalPolicy = "never",
+    network_access: bool = True,
     version: Literal["auto", "sandbox", "latest"] | str = "auto",
     config_overrides: dict[str, str] | None = None,
     debug: bool | None = None,
@@ -119,12 +133,28 @@ def codex_cli(
             tools available to the agent running in the sandbox.
         web_search: Web search mode. Use "live" for live web search, "cached" for cached web search, or "disabled" to disable web search. Defaults to "live".
         goals: Enable Codex goal tools (defaults to `True`).
+        auto_review: Enable Codex automated approval review (guardian). When enabled,
+            Codex runs with its own sandbox active (`workspace-write`) and `on-request`
+            approvals; escalation requests (e.g. network access, writes outside the
+            workspace) are adjudicated by a guardian model rather than auto-approved.
+            Pass `CodexAutoReview` to customize the guardian policy and model.
+            Requires Codex CLI >= 0.137.0. Defaults to `False`.
         centaur: Run in 'centaur' mode, which makes Codex CLI available to an Inspect `human_cli()` agent rather than running it unattended.
         attempts: Configure agent to make multiple attempts. When this is specified, the task will be scored when the agent stops calling tools. If the scoring is successful, execution will stop. Otherwise, the agent will be prompted to pick up where it left off for another attempt.
         model: Model name to use (defaults to main model for task).
         model_aliases: Optional mapping of model names to Model instances or model name strings.
             Allows using custom Model implementations (e.g., wrapped Agents) instead of standard models.
             When a model name in the mapping is referenced, the corresponding Model/string is used.
+        transparent_proxy: Run the bridge as a faithful transparent proxy (defaults
+            to `False`). When `True`, each request is routed to the model the agent
+            actually asked for -- no alias table and no fallback collapse onto the
+            session model -- and the client's generation parameters are treated as
+            authoritative. Required when the agent makes internal model calls of its
+            own that must reach their real provider model rather than being served by
+            the session model, e.g. Codex's `auto_review` reviewer (`codex-auto-review`)
+            under `approval_policy="on-request"`. With the default `False`, such a
+            request falls through to the fallback model, so the reviewer is silently
+            served by the session model instead of OpenAI's reviewer.
         filter: Filter for intercepting bridged model requests.
         retry_refusals: Should refusals be retried? (pass number of times to retry)
         home_dir: Home directory to use for codex cli. If set, AGENTS.md, skills, and the MCP configuration will be written here.
@@ -132,6 +162,25 @@ def codex_cli(
         env: Environment variables to set for codex cli
         user: User to execute codex cli with.
         sandbox: Optional sandbox environment name.
+        sandbox_mode: Codex's own sandbox policy for model-generated shell commands
+            (`-s`/`--sandbox`), not related to the `sandbox` option above that selects
+            an Inspect sandbox environment. Defaults to `"danger-full-access"`, which
+            combined with `approval_policy="never"` (the default) reproduces the
+            original `--dangerously-bypass-approvals-and-sandbox` behavior. Passing
+            `"workspace-write"` or `"read-only"` runs Codex's own Linux sandbox
+            (bubblewrap); this requires the sandbox environment to allow unprivileged
+            user namespace creation. The policy applies only to model-generated shell
+            commands: the Codex parent process contacts MCP servers and the model proxy
+            outside that sandbox. With the default `approval_policy="never"`, a
+            `"read-only"` sandbox denies writes outright because no approval path is
+            available.
+        approval_policy: Codex's approval policy (`AskForApproval`). Defaults to
+            `"never"` (commands are never escalated to interactive approval --
+            required for headless `codex exec`, which cannot answer approval
+            prompts). `-a`/`--ask-for-approval` is not accepted by `codex exec`, so
+            this is applied via `-c approval_policy=<value>`.
+        network_access: Whether Codex's `"workspace-write"` sandbox may access the
+            network. Defaults to `True`; ignored by other sandbox modes.
         version: Version of codex cli to use. One of:
             - "auto": Use any available version of codex cli in the sandbox, otherwise download the latest version.
             - "sandbox": Use the version of codex cli in the sandbox (raises `RuntimeError` if codex is not available in the sandbox)
@@ -160,6 +209,10 @@ def codex_cli(
         cast(dict[str, Any], deprecated_args)
     )
     effective_web_search = resolve_codex_web_search(web_search, disallowed_tools)
+    effective_approval_policy = resolve_codex_approval_policy(
+        approval_policy, config_overrides
+    )
+    resolved_auto_review = resolve_codex_auto_review(auto_review)
 
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
@@ -179,8 +232,13 @@ def codex_cli(
             checkpointer() as cp,
             sandbox_agent_bridge(
                 state,
-                model=bridge_model,
-                model_aliases=model_aliases,
+                model=None if transparent_proxy else bridge_model,
+                model_aliases=None
+                if transparent_proxy
+                else resolve_codex_auto_review_model_aliases(
+                    resolved_auto_review, model_aliases
+                ),
+                forward_generation_config=transparent_proxy,
                 filter=filter,
                 sandbox=sandbox,
                 retry_refusals=retry_refusals,
@@ -198,6 +256,18 @@ def codex_cli(
                 codex_cli_binary_source(), version, user, sandbox_env(sandbox)
             )
 
+            # resolve the installed codex version once (shared by the
+            # auto_review gate and model alignment below)
+            codex_version = await codex_binary_version(
+                sandbox_env(sandbox), codex_binary, user
+            )
+
+            # auto_review requires on-request approval support (>= 0.137.0 for
+            # headless exec); the floor is applied in centaur mode too so
+            # behavior is consistent across modes
+            if resolved_auto_review is not None:
+                check_codex_auto_review_version(codex_version)
+
             # build system prompt
             system_messages = [
                 m.text for m in state.messages if isinstance(m, ChatMessageSystem)
@@ -212,9 +282,7 @@ def codex_cli(
             agent_cwd = await resolve_agent_cwd(sbox, user, cwd)
 
             # align Codex's `--model` slug to the real bridged model
-            codex_model = await resolve_codex_model(
-                model, model_config, sbox, codex_binary, user
-            )
+            codex_model = await resolve_codex_model(model, model_config, codex_version)
 
             # determine CODEX_HOME (default to agent working dir)
             if home_dir is None:
@@ -270,18 +338,29 @@ def codex_cli(
                     # selects Codex's system prompt + tool set (see codex_model above)
                     "--model",
                     codex_model,
-                    "--dangerously-bypass-approvals-and-sandbox",
                 ]
+            )
+            # with auto_review, approvals/sandbox come from config (on-request +
+            # workspace-write); the bypass flag would force approval_policy=never
+            # at a precedence -c can't beat
+            if resolved_auto_review is None:
+                cmd.append("--dangerously-bypass-approvals-and-sandbox")
+
+            cmd.extend(
+                codex_sandbox_args(
+                    sandbox_mode, effective_approval_policy, network_access
+                )
             )
 
             # apply config overrides
             if config_overrides:
                 for key, value in config_overrides.items():
-                    cmd.extend(["-c", f"{key}={value}"])
+                    if key != "approval_policy":
+                        cmd.extend(["-c", f"{key}={value}"])
 
             # apply final Codex config overrides for explicit arguments
             for key, value in codex_cli_config_overrides(
-                effective_web_search, goals
+                effective_web_search, goals, resolved_auto_review
             ).items():
                 cmd.extend(["-c", f"{key}={value}"])
 
@@ -291,17 +370,21 @@ def codex_cli(
             # disable codex analytics (both the chatgpt.com analytics-events
             # sink and the always-on Statsig OTel metrics to ab.chatgpt.com)
             toml_config["analytics"] = {"enabled": False}
-            toml_config.update(codex_config_options(effective_web_search, goals))
+            toml_config.update(
+                codex_config_options(effective_web_search, goals, resolved_auto_review)
+            )
 
-            # register mcp servers (combine static configs with bridged tools)
-            all_mcp_servers = list(mcp_servers or []) + bridge.mcp_server_configs
-            if all_mcp_servers:
-                for mcp_server in all_mcp_servers:
-                    toml_config[f"mcp_servers.{mcp_server.name}"] = (
-                        mcp_server.model_dump(
-                            exclude={"name", "tools"}, exclude_none=True
-                        )
-                    )
+            # Register static MCP servers unchanged. Bridged tools are supplied by the
+            # evaluation author, so headless approval can safely skip their MCP gate.
+            for mcp_server in mcp_servers or []:
+                toml_config[f"mcp_servers.{mcp_server.name}"] = mcp_server.model_dump(
+                    exclude={"name", "tools"}, exclude_none=True
+                )
+            for mcp_server in bridge.mcp_server_configs:
+                toml_config[f"mcp_servers.{mcp_server.name}"] = codex_mcp_server_toml(
+                    mcp_server.model_dump(exclude={"name", "tools"}, exclude_none=True),
+                    effective_approval_policy,
+                )
 
             # model provider (use a custom provider name so we can set
             # stream_idle_timeout_ms -- built-in providers can't be overridden)
@@ -433,9 +516,7 @@ def codex_cli(
 async def resolve_codex_model(
     model: str | None,
     model_config: str | None,
-    sandbox: SandboxEnvironment,
-    codex_binary: str,
-    user: str | None,
+    codex_version: str | None,
 ) -> str:
     """Resolve the Codex `--model` slug aligned to the real bridged model.
 
@@ -456,7 +537,6 @@ async def resolve_codex_model(
     # service_model_name() (e.g. a custom 'otter' provider -> 'gpt-5.5'); align to
     # that, not the registry name ('otter'), which Codex wouldn't recognize.
     model_name = openai_service_model_name(api, real_model.name)
-    codex_version = await codex_binary_version(sandbox, codex_binary, user)
     codex_catalog = await codex_models_catalog(codex_version)
     resolution = resolve_codex_model_slug(
         model_name,
