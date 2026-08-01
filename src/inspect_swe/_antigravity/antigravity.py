@@ -354,8 +354,18 @@ def antigravity(
             # reads its MCP config at startup and the bridge proxy starts
             # asynchronously, so launching early yields an agent with no bridged
             # tools and NO error, whose output is then scored as a valid
-            # trajectory. Raises if the endpoint never serves tools.
-            await wait_for_mcp_endpoints([mcp_server], bridge, required=True)
+            # trajectory. Raises if an endpoint never serves tools. Static
+            # caller-provided servers are NOT probed (their availability is the
+            # caller's contract).
+            _bridged_http_configs = [
+                c
+                for c in bridge.mcp_server_configs
+                if isinstance(c, MCPServerConfigHTTP)
+            ]
+            if _bridged_http_configs:
+                await wait_for_mcp_endpoints(
+                    _bridged_http_configs, bridge, required=True
+                )
 
             result = await sbox.exec_remote(
                 cmd=spec.command,

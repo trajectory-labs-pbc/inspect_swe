@@ -22,6 +22,7 @@ from inspect_ai.model import (
 )
 from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
+from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.util import SandboxEnvironment, checkpointer, store
 from inspect_ai.util import sandbox as sandbox_env
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
@@ -29,6 +30,7 @@ from typing_extensions import Unpack
 
 from inspect_swe._util._async import is_callable_coroutine
 from inspect_swe._util.centaur import CentaurOptions, run_centaur
+from inspect_swe._util.mcp_ready import wait_for_mcp_endpoints
 from inspect_swe._util.messages import build_user_prompt
 from inspect_swe._util.path import join_path
 from inspect_swe._util.sandbox import resolve_agent_cwd, sandbox_exec
@@ -96,6 +98,7 @@ def codex_cli(
     attempts: int | AgentAttempts = 1,
     model: str | None = None,
     model_aliases: dict[str, str | Model] | None = None,
+    transparent_proxy: bool = False,
     filter: GenerateFilter | None = None,
     retry_refusals: int | None = None,
     home_dir: str | None = None,
@@ -146,6 +149,10 @@ def codex_cli(
         model_aliases: Optional mapping of model names to Model instances or model name strings.
             Allows using custom Model implementations (e.g., wrapped Agents) instead of standard models.
             When a model name in the mapping is referenced, the corresponding Model/string is used.
+        transparent_proxy: Retain the model identity and generation configuration
+            requested by the agent instead of using the bridge alias table or
+            fallback model (supports agents' internal model calls that must reach
+            their intended provider model). Cannot be combined with `auto_review`.
         filter: Filter for intercepting bridged model requests.
         retry_refusals: Should refusals be retried? (pass number of times to retry)
         home_dir: Home directory to use for codex cli. If set, AGENTS.md, skills, and the MCP configuration will be written here.
@@ -234,6 +241,11 @@ def codex_cli(
     )
     effective_web_search = resolve_codex_web_search(web_search, disallowed_tools)
     resolved_auto_review = resolve_codex_auto_review(auto_review)
+    if resolved_auto_review is not None and transparent_proxy:
+        # the guardian (auto_review) model resolves through the bridge alias
+        # table, which transparent_proxy disables -- the guardian slug would be
+        # forwarded verbatim to the provider and fail
+        raise ValueError("transparent_proxy cannot be combined with auto_review.")
     if resolved_auto_review is not None:
         # auto_review is a macro over the sandbox/approval controls: it forces
         # workspace-write + on-request with a guardian reviewer via final -c
@@ -303,10 +315,13 @@ def codex_cli(
             checkpointer() as cp,
             sandbox_agent_bridge(
                 state,
-                model=bridge_model,
-                model_aliases=resolve_codex_auto_review_model_aliases(
+                model=None if transparent_proxy else bridge_model,
+                model_aliases=None
+                if transparent_proxy
+                else resolve_codex_auto_review_model_aliases(
                     resolved_auto_review, model_aliases
                 ),
+                forward_generation_config=transparent_proxy,
                 filter=filter,
                 sandbox=sandbox,
                 retry_refusals=retry_refusals,
@@ -541,6 +556,21 @@ def codex_cli(
                         or cp.attempt == "resume"
                     ):
                         agent_cmd.extend(["resume", "--last"])
+
+                    # Bridged MCP endpoints must be live BEFORE launch: this
+                    # agent reads its MCP config at startup, and the bridge
+                    # proxy starts asynchronously. Launching early yields an
+                    # agent with no bridged tools and NO error, whose output is
+                    # then scored as a valid trajectory. Raises if unreachable.
+                    _http_mcp_configs = [
+                        c
+                        for c in bridge.mcp_server_configs
+                        if isinstance(c, MCPServerConfigHTTP)
+                    ]
+                    if _http_mcp_configs:
+                        await wait_for_mcp_endpoints(
+                            _http_mcp_configs, bridge, required=True
+                        )
 
                     # run agent
                     result = await sbox.exec_remote(
