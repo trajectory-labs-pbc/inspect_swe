@@ -75,6 +75,12 @@ from .model_catalog import (
 
 logger = getLogger(__file__)
 
+# Seconds codex waits for an MCP server to come up before giving up on it and
+# running the agent without its tools. Codex's own default sits far below the
+# startup time of a sandboxed server on a loaded host, and exceeding it fails
+# SILENTLY -- the agent is simply handed no tools (see the call site).
+MCP_STARTUP_TIMEOUT_SEC = 300
+
 
 @agent
 def codex_cli(
@@ -374,17 +380,33 @@ def codex_cli(
                 codex_config_options(effective_web_search, goals, resolved_auto_review)
             )
 
-            # Register static MCP servers unchanged. Bridged tools are supplied by the
-            # evaluation author, so headless approval can safely skip their MCP gate.
+            # Codex awaits its MCP tool list at session start
+            # (`session_init.required_mcp_wait`) rather than starting with a
+            # pending server -- but that wait is bounded by a per-server
+            # `startup_timeout_sec` we never set, so it ran on codex's built-in
+            # default. When a sandboxed server takes longer than that to come
+            # up, codex proceeds with the server FAILED and the agent has no
+            # environment tools. It then does nothing and its empty trajectory
+            # is SCORED, with no error to retry on. Measured at 2.4% of 250
+            # samples at 150-way concurrency; 87/4130 across a production
+            # collection. setdefault, so an explicit author setting still wins.
+            #
+            # Register static MCP servers otherwise unchanged. Bridged tools are
+            # supplied by the evaluation author, so headless approval can safely
+            # skip their MCP gate.
             for mcp_server in mcp_servers or []:
-                toml_config[f"mcp_servers.{mcp_server.name}"] = mcp_server.model_dump(
+                server_toml = mcp_server.model_dump(
                     exclude={"name", "tools"}, exclude_none=True
                 )
+                server_toml.setdefault("startup_timeout_sec", MCP_STARTUP_TIMEOUT_SEC)
+                toml_config[f"mcp_servers.{mcp_server.name}"] = server_toml
             for mcp_server in bridge.mcp_server_configs:
-                toml_config[f"mcp_servers.{mcp_server.name}"] = codex_mcp_server_toml(
+                server_toml = codex_mcp_server_toml(
                     mcp_server.model_dump(exclude={"name", "tools"}, exclude_none=True),
                     effective_approval_policy,
                 )
+                server_toml.setdefault("startup_timeout_sec", MCP_STARTUP_TIMEOUT_SEC)
+                toml_config[f"mcp_servers.{mcp_server.name}"] = server_toml
 
             # model provider (use a custom provider name so we can set
             # stream_idle_timeout_ms -- built-in providers can't be overridden)
