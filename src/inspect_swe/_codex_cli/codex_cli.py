@@ -21,13 +21,7 @@ from inspect_ai.model import (
     get_model,
 )
 from inspect_ai.scorer import score
-from inspect_ai.tool import (
-    MCPServerConfig,
-    MCPServerConfigHTTP,
-    Skill,
-    install_skills,
-    read_skills,
-)
+from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.util import SandboxEnvironment, checkpointer, store
 from inspect_ai.util import sandbox as sandbox_env
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
@@ -35,7 +29,6 @@ from typing_extensions import Unpack
 
 from inspect_swe._util._async import is_callable_coroutine
 from inspect_swe._util.centaur import CentaurOptions, run_centaur
-from inspect_swe._util.mcp_ready import wait_for_mcp_endpoints
 from inspect_swe._util.messages import build_user_prompt
 from inspect_swe._util.path import join_path
 from inspect_swe._util.sandbox import resolve_agent_cwd, sandbox_exec
@@ -64,7 +57,9 @@ from .config import (
     resolve_codex_auto_review,
     resolve_codex_auto_review_model_aliases,
     resolve_codex_deprecated_args,
+    resolve_codex_sandbox_mode,
     resolve_codex_web_search,
+    validate_codex_network_access,
 )
 from .model_catalog import (
     is_latest_openai_model,
@@ -101,7 +96,6 @@ def codex_cli(
     attempts: int | AgentAttempts = 1,
     model: str | None = None,
     model_aliases: dict[str, str | Model] | None = None,
-    transparent_proxy: bool = False,
     filter: GenerateFilter | None = None,
     retry_refusals: int | None = None,
     home_dir: str | None = None,
@@ -109,12 +103,13 @@ def codex_cli(
     env: dict[str, str] | None = None,
     user: str | None = None,
     sandbox: str | None = None,
-    sandbox_mode: CodexSandboxMode = "danger-full-access",
-    approval_policy: CodexApprovalPolicy = "never",
-    network_access: bool = True,
     version: Literal["auto", "sandbox", "latest"] | str = "auto",
     config_overrides: dict[str, str] | None = None,
     debug: bool | None = None,
+    sandbox_mode: CodexSandboxMode = "danger-full-access",
+    approval_policy: CodexApprovalPolicy = "never",
+    network_access: bool = True,
+    approve_static_mcp_tools: bool = False,
     **deprecated_args: Unpack[CodexDeprecatedArgs],
 ) -> Agent:
     """Codex CLI.
@@ -151,16 +146,6 @@ def codex_cli(
         model_aliases: Optional mapping of model names to Model instances or model name strings.
             Allows using custom Model implementations (e.g., wrapped Agents) instead of standard models.
             When a model name in the mapping is referenced, the corresponding Model/string is used.
-        transparent_proxy: Run the bridge as a faithful transparent proxy (defaults
-            to `False`). When `True`, each request is routed to the model the agent
-            actually asked for -- no alias table and no fallback collapse onto the
-            session model -- and the client's generation parameters are treated as
-            authoritative. Required when the agent makes internal model calls of its
-            own that must reach their real provider model rather than being served by
-            the session model, e.g. Codex's `auto_review` reviewer (`codex-auto-review`)
-            under `approval_policy="on-request"`. With the default `False`, such a
-            request falls through to the fallback model, so the reviewer is silently
-            served by the session model instead of OpenAI's reviewer.
         filter: Filter for intercepting bridged model requests.
         retry_refusals: Should refusals be retried? (pass number of times to retry)
         home_dir: Home directory to use for codex cli. If set, AGENTS.md, skills, and the MCP configuration will be written here.
@@ -168,33 +153,66 @@ def codex_cli(
         env: Environment variables to set for codex cli
         user: User to execute codex cli with.
         sandbox: Optional sandbox environment name.
-        sandbox_mode: Codex's own sandbox policy for model-generated shell commands
-            (`-s`/`--sandbox`), not related to the `sandbox` option above that selects
-            an Inspect sandbox environment. Defaults to `"danger-full-access"`, which
-            combined with `approval_policy="never"` (the default) reproduces the
-            original `--dangerously-bypass-approvals-and-sandbox` behavior. Passing
-            `"workspace-write"` or `"read-only"` runs Codex's own Linux sandbox
-            (bubblewrap); this requires the sandbox environment to allow unprivileged
-            user namespace creation. The policy applies only to model-generated shell
-            commands: the Codex parent process contacts MCP servers and the model proxy
-            outside that sandbox. With the default `approval_policy="never"`, a
-            `"read-only"` sandbox denies writes outright because no approval path is
-            available.
-        approval_policy: Codex's approval policy (`AskForApproval`). Defaults to
-            `"never"` (commands are never escalated to interactive approval --
-            required for headless `codex exec`, which cannot answer approval
-            prompts). `-a`/`--ask-for-approval` is not accepted by `codex exec`, so
-            this is applied via `-c approval_policy=<value>`.
-        network_access: Whether Codex's `"workspace-write"` sandbox may access the
-            network. Defaults to `True`; ignored by other sandbox modes.
         version: Version of codex cli to use. One of:
             - "auto": Use any available version of codex cli in the sandbox, otherwise download the latest version.
             - "sandbox": Use the version of codex cli in the sandbox (raises `RuntimeError` if codex is not available in the sandbox)
             - "latest": Download and use the very latest version of codex cli.
             - "x.x.x": Download and use a specific version of codex cli.
         config_overrides: Additional Codex CLI configuration overrides.
-            Each key-value pair is passed as `-c key=value` to the CLI.
+            Each key-value pair is passed as `-c key=value` to the CLI, except
+            `approval_policy` and `sandbox_mode`, which are intercepted and
+            validated (invalid values raise `ValueError`) so that command
+            construction and the bridged-MCP configuration are derived from one
+            effective value rather than silently disagreeing with the raw flag.
         debug: Trace all debug output.
+        sandbox_mode: Codex's own sandbox policy for model-generated shell commands
+            (`-s`/`--sandbox`), not related to the `sandbox` option above that selects
+            an Inspect sandbox environment. Defaults to `"danger-full-access"`, which
+            combined with `approval_policy="never"` (the default) reproduces the
+            original `--dangerously-bypass-approvals-and-sandbox` behavior.
+
+            The restricted modes run Codex's Linux sandbox, which on current codex
+            releases requires a system `bwrap` (bubblewrap) binary in the sandbox
+            image -- the codex release archive ships only the codex binary, so no
+            bundled fallback exists, and codex panics at shell launch without it
+            (this agent fails fast with an actionable error instead). The container
+            runtime must also permit unprivileged user namespace creation; Docker's
+            default seccomp profile does not. The mechanism is version-dependent:
+            codex <= 0.77 used Landlock+seccomp (no bwrap), 0.98 had bwrap opt-in.
+
+            Mode semantics for model-generated commands (the Codex parent process
+            contacts MCP servers and the model proxy outside this sandbox):
+            `"read-only"` blocks writes AND network, and with the default
+            `approval_policy="never"` denies writes outright with no approval path
+            (the agent cannot edit anything). `"workspace-write"` makes cwd, `/tmp`
+            and `$TMPDIR` writable, but remounts top-level `.git` (and
+            `.agents`/`.codex`) in each writable root read-only -- model-run
+            `git commit`/`checkout`/`stash` fail (flip side: the agent cannot tamper
+            with its own `.codex` CODEX_HOME).
+        approval_policy: Codex's approval policy (`AskForApproval`). Defaults to
+            `"never"`. Under headless `codex exec` (the default), codex itself
+            overrides the runtime policy to `never` regardless of this setting
+            (verified on codex 0.42.0 through 0.145.0), so a non-`"never"` value
+            without an approvals reviewer raises `ValueError` here rather than
+            silently breaking bridged tools. Prompting policies are effective in
+            centaur mode, or headless with
+            `config_overrides={"approvals_reviewer": ...}` (codex's auto-review
+            escape hatch).
+        network_access: Whether Codex's `"workspace-write"` sandbox may access the
+            network for model-generated commands. Defaults to `True` -- note this
+            inverts Codex's own default (`false`) to preserve continuity with the
+            previous unconditional full-access behavior; ignored by other sandbox
+            modes. `config_overrides={"sandbox_workspace_write.network_access":
+            "false"}` also wins over this setting (later `-c` pairs take
+            precedence in codex).
+        approve_static_mcp_tools: Also pre-approve tool calls from static
+            `mcp_servers` (not just Inspect-bridged servers) when the effective
+            approval policy is `"never"`. Defaults to `False`: static servers keep
+            Codex's per-server default gate. Note that under the restricted
+            sandbox modes that default cancels un-annotated static tool calls
+            headlessly (inspect's `MCPServerConfig` cannot express
+            `default_tools_approval_mode`), so set this to `True` if you combine
+            `sandbox_mode` with static `mcp_servers`.
         **deprecated_args: Deprecated compatibility arguments.
     """
     # resolve centaur
@@ -215,10 +233,57 @@ def codex_cli(
         cast(dict[str, Any], deprecated_args)
     )
     effective_web_search = resolve_codex_web_search(web_search, disallowed_tools)
-    effective_approval_policy = resolve_codex_approval_policy(
-        approval_policy, config_overrides
-    )
     resolved_auto_review = resolve_codex_auto_review(auto_review)
+    if resolved_auto_review is not None:
+        # auto_review is a macro over the sandbox/approval controls: it forces
+        # workspace-write + on-request with a guardian reviewer via final -c
+        # overrides that must keep winning at the CLI level. Explicitly
+        # combining it with these controls is contradictory -- fail loudly.
+        if (
+            sandbox_mode != "danger-full-access"
+            or approval_policy != "never"
+            or any(
+                key in (config_overrides or {})
+                for key in ("sandbox_mode", "approval_policy", "approvals_reviewer")
+            )
+        ):
+            raise ValueError(
+                "auto_review manages sandbox_mode, approval_policy and the "
+                "approvals reviewer itself (workspace-write / on-request / "
+                "guardian); do not combine it with explicit sandbox_mode, "
+                "approval_policy, or those config_overrides keys."
+            )
+        effective_approval_policy: CodexApprovalPolicy = "on-request"
+        effective_sandbox_mode: CodexSandboxMode = "workspace-write"
+    else:
+        effective_approval_policy = resolve_codex_approval_policy(
+            approval_policy, config_overrides
+        )
+        effective_sandbox_mode = resolve_codex_sandbox_mode(
+            sandbox_mode, config_overrides
+        )
+
+        # Headless `codex exec` hard-overrides the runtime approval policy to
+        # `never` (harness override, precedence over `-c`; verified empirically
+        # on 0.42.0-0.145.0), EXCEPT when an approvals reviewer is configured. A
+        # prompting policy here would therefore not prompt -- but it WOULD
+        # disable the bridged-MCP approval override below, cancelling every
+        # bridged tool call. Fail fast instead of silently losing the agent's
+        # tools.
+        if (
+            centaur is False
+            and effective_approval_policy != "never"
+            and (config_overrides or {}).get("approvals_reviewer") is None
+        ):
+            raise ValueError(
+                f"approval_policy={effective_approval_policy!r} has no effect "
+                "under headless `codex exec`: codex overrides the runtime policy "
+                "to 'never' and bridged MCP tools would lose their approval "
+                "override. Use approval_policy='never', run in centaur mode, "
+                "enable auto_review, or configure an approvals reviewer via "
+                "config_overrides={'approvals_reviewer': ...}."
+            )
+    network_access = validate_codex_network_access(network_access)
 
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
@@ -238,13 +303,10 @@ def codex_cli(
             checkpointer() as cp,
             sandbox_agent_bridge(
                 state,
-                model=None if transparent_proxy else bridge_model,
-                model_aliases=None
-                if transparent_proxy
-                else resolve_codex_auto_review_model_aliases(
+                model=bridge_model,
+                model_aliases=resolve_codex_auto_review_model_aliases(
                     resolved_auto_review, model_aliases
                 ),
-                forward_generation_config=transparent_proxy,
                 filter=filter,
                 sandbox=sandbox,
                 retry_refusals=retry_refusals,
@@ -283,6 +345,27 @@ def codex_cli(
 
             # resolve sandbox
             sbox = sandbox_env(sandbox)
+
+            # Codex's restricted sandbox modes shell out to bubblewrap, and the
+            # codex release archive ships no bundled bwrap (single-binary
+            # tarball), so a system bwrap must exist in the sandbox image.
+            # Without one codex PANICS at sandbox launch on every
+            # model-generated shell command -- fail fast with an actionable
+            # error instead of a mid-eval panic.
+            if effective_sandbox_mode != "danger-full-access":
+                bwrap_probe = await sandbox_exec(
+                    sbox, "command -v bwrap || echo __MISSING__", user=user
+                )
+                if bwrap_probe.endswith("__MISSING__"):
+                    raise RuntimeError(
+                        f"sandbox_mode={effective_sandbox_mode!r} requires a "
+                        "bubblewrap (bwrap) binary in the sandbox image: codex "
+                        "release binaries do not bundle one. Install the "
+                        "'bubblewrap' package in the image, or use "
+                        "sandbox_mode='danger-full-access'. The container runtime "
+                        "must also permit unprivileged user namespace creation "
+                        "(Docker's default seccomp profile blocks it)."
+                    )
 
             # resolve working directory (home dir if sandbox default is '/')
             agent_cwd = await resolve_agent_cwd(sbox, user, cwd)
@@ -346,22 +429,24 @@ def codex_cli(
                     codex_model,
                 ]
             )
-            # with auto_review, approvals/sandbox come from config (on-request +
-            # workspace-write); the bypass flag would force approval_policy=never
-            # at a precedence -c can't beat
+            # Sandbox/approval args from the effective values. With auto_review,
+            # approvals/sandbox come from its final -c overrides instead
+            # (on-request + workspace-write): an explicit --sandbox or bypass
+            # flag would force settings at a precedence -c can't beat.
             if resolved_auto_review is None:
-                cmd.append("--dangerously-bypass-approvals-and-sandbox")
-
-            cmd.extend(
-                codex_sandbox_args(
-                    sandbox_mode, effective_approval_policy, network_access
+                cmd.extend(
+                    codex_sandbox_args(
+                        effective_sandbox_mode,
+                        effective_approval_policy,
+                        network_access,
+                    )
                 )
-            )
 
-            # apply config overrides
+            # apply config overrides (approval_policy and sandbox_mode are
+            # intercepted into the effective values above rather than passed raw)
             if config_overrides:
                 for key, value in config_overrides.items():
-                    if key != "approval_policy":
+                    if key not in ("approval_policy", "sandbox_mode"):
                         cmd.extend(["-c", f"{key}={value}"])
 
             # apply final Codex config overrides for explicit arguments
@@ -380,33 +465,32 @@ def codex_cli(
                 codex_config_options(effective_web_search, goals, resolved_auto_review)
             )
 
-            # Codex awaits its MCP tool list at session start
-            # (`session_init.required_mcp_wait`) rather than starting with a
-            # pending server -- but that wait is bounded by a per-server
-            # `startup_timeout_sec` we never set, so it ran on codex's built-in
-            # default. When a sandboxed server takes longer than that to come
-            # up, codex proceeds with the server FAILED and the agent has no
-            # environment tools. It then does nothing and its empty trajectory
-            # is SCORED, with no error to retry on. Measured at 2.4% of 250
-            # samples at 150-way concurrency; 87/4130 across a production
-            # collection. setdefault, so an explicit author setting still wins.
-            #
-            # Register static MCP servers otherwise unchanged. Bridged tools are
-            # supplied by the evaluation author, so headless approval can safely
-            # skip their MCP gate.
+            # Register static MCP servers. Bridged tools are supplied by the
+            # evaluation author, so headless approval always skips their MCP gate;
+            # static caller-configured servers keep Codex's per-server default
+            # unless approve_static_mcp_tools opts them in (under the restricted
+            # sandbox modes that default cancels un-annotated tool calls
+            # headlessly -- see the approve_static_mcp_tools docstring).
+            # setdefault so an author who sets startup_timeout_sec explicitly
+            # still wins; codex's own default is far below sandboxed-server
+            # startup time and exceeding it silently drops the server's tools.
             for mcp_server in mcp_servers or []:
-                server_toml = mcp_server.model_dump(
+                static_toml = mcp_server.model_dump(
                     exclude={"name", "tools"}, exclude_none=True
                 )
-                server_toml.setdefault("startup_timeout_sec", MCP_STARTUP_TIMEOUT_SEC)
-                toml_config[f"mcp_servers.{mcp_server.name}"] = server_toml
+                if approve_static_mcp_tools:
+                    static_toml = codex_mcp_server_toml(
+                        static_toml, effective_approval_policy
+                    )
+                static_toml.setdefault("startup_timeout_sec", MCP_STARTUP_TIMEOUT_SEC)
+                toml_config[f"mcp_servers.{mcp_server.name}"] = static_toml
             for mcp_server in bridge.mcp_server_configs:
-                server_toml = codex_mcp_server_toml(
+                bridged_toml = codex_mcp_server_toml(
                     mcp_server.model_dump(exclude={"name", "tools"}, exclude_none=True),
                     effective_approval_policy,
                 )
-                server_toml.setdefault("startup_timeout_sec", MCP_STARTUP_TIMEOUT_SEC)
-                toml_config[f"mcp_servers.{mcp_server.name}"] = server_toml
+                bridged_toml.setdefault("startup_timeout_sec", MCP_STARTUP_TIMEOUT_SEC)
+                toml_config[f"mcp_servers.{mcp_server.name}"] = bridged_toml
 
             # model provider (use a custom provider name so we can set
             # stream_idle_timeout_ms -- built-in providers can't be overridden)
@@ -459,21 +543,6 @@ def codex_cli(
                         agent_cmd.extend(["resume", "--last"])
 
                     # run agent
-                    # Bridged MCP endpoints must be live BEFORE launch: this
-                    # agent reads its MCP config at startup, and the bridge
-                    # proxy starts asynchronously. Launching early yields an
-                    # agent with no bridged tools and NO error, whose output is
-                    # then scored as a valid trajectory. Raises if unreachable.
-                    _http_mcp_configs = [
-                        c
-                        for c in bridge.mcp_server_configs
-                        if isinstance(c, MCPServerConfigHTTP)
-                    ]
-                    if _http_mcp_configs:
-                        await wait_for_mcp_endpoints(
-                            _http_mcp_configs, bridge, required=True
-                        )
-
                     result = await sbox.exec_remote(
                         cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
                         + agent_cmd,
