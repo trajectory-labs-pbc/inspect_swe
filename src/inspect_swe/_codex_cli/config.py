@@ -6,6 +6,8 @@ from inspect_ai.tool import MCPServerConfig
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import TypedDict
 
+MCP_STARTUP_TIMEOUT_SEC = 300
+
 CodexWebSearch = Literal["live", "cached", "disabled"]
 
 
@@ -162,7 +164,9 @@ def check_codex_auto_review_version(version: str | None) -> None:
 
 
 def codex_mcp_server_config(
-    mcp_server: MCPServerConfig, bridged_server_names: AbstractSet[str]
+    mcp_server: MCPServerConfig,
+    bridged_server_names: AbstractSet[str],
+    bridged_startup_timeout: int | None = MCP_STARTUP_TIMEOUT_SEC,
 ) -> dict[str, Any]:
     """TOML table for one `mcp_servers.<name>` entry in codex config.
 
@@ -178,4 +182,6 @@ def codex_mcp_server_config(
     server_config = mcp_server.model_dump(exclude={"name", "tools"}, exclude_none=True)
     if mcp_server.name in bridged_server_names:
         server_config["required"] = True
+        if bridged_startup_timeout is not None:
+            server_config["startup_timeout_sec"] = bridged_startup_timeout
     return server_config

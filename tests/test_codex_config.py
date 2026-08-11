@@ -261,3 +261,33 @@ def test_static_mcp_server_is_not_marked_required() -> None:
     config = codex_mcp_server_config(server, {"bridged-tools"})
 
     assert "required" not in config
+
+
+def test_bridged_mcp_server_gets_the_startup_timeout() -> None:
+    server = MCPServerConfigHTTP(
+        type="http", name="bridged-tools", url="http://localhost:9000/mcp"
+    )
+
+    config = codex_mcp_server_config(server, {"bridged-tools"})
+
+    assert config["startup_timeout_sec"] == 300
+
+
+def test_static_mcp_server_keeps_codex_default_startup_timeout() -> None:
+    server = MCPServerConfigHTTP(
+        type="http", name="caller-tools", url="http://localhost:9001/mcp"
+    )
+
+    config = codex_mcp_server_config(server, {"bridged-tools"})
+
+    assert "startup_timeout_sec" not in config
+
+
+def test_bridged_mcp_server_accepts_an_explicit_startup_timeout() -> None:
+    server = MCPServerConfigHTTP(
+        type="http", name="bridged-tools", url="http://localhost:9000/mcp"
+    )
+
+    config = codex_mcp_server_config(server, {"bridged-tools"}, 60)
+
+    assert config["startup_timeout_sec"] == 60

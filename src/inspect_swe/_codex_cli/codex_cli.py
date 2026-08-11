@@ -53,6 +53,7 @@ from .agentbinary import (
     codex_models_catalog,
 )
 from .config import (
+    MCP_STARTUP_TIMEOUT_SEC,
     CodexAutoReview,
     CodexDeprecatedArgs,
     CodexWebSearch,
@@ -88,6 +89,7 @@ def codex_cli(
     mcp_servers: Sequence[MCPServerConfig] | None = None,
     bridged_tools: Sequence[BridgedToolsSpec] | None = None,
     mcp_ready_timeout: float = DEFAULT_MCP_READY_TIMEOUT,
+    mcp_startup_timeout: int | None = MCP_STARTUP_TIMEOUT_SEC,
     web_search: CodexWebSearch = "live",
     goals: bool = True,
     auto_review: bool | CodexAutoReview = False,
@@ -129,6 +131,8 @@ def codex_cli(
             tools available to the agent running in the sandbox.
         mcp_ready_timeout: Seconds to wait for bridged MCP endpoints to serve
             tools before the agent launch errors.
+        mcp_startup_timeout: Seconds Codex waits for bridged MCP server startup.
+            Defaults to 300; pass `None` to use Codex's default.
         web_search: Web search mode. Use "live" for live web search, "cached" for cached web search, or "disabled" to disable web search. Defaults to "live".
         goals: Enable Codex goal tools (defaults to `True`).
         auto_review: Enable Codex automated approval review (guardian). When enabled,
@@ -339,9 +343,10 @@ def codex_cli(
             all_mcp_servers = list(mcp_servers or []) + bridge.mcp_server_configs
             if all_mcp_servers:
                 for mcp_server in all_mcp_servers:
-                    toml_config[f"mcp_servers.{mcp_server.name}"] = (
-                        codex_mcp_server_config(mcp_server, bridged_server_names)
+                    server_toml = codex_mcp_server_config(
+                        mcp_server, bridged_server_names, mcp_startup_timeout
                     )
+                    toml_config[f"mcp_servers.{mcp_server.name}"] = server_toml
 
             # model provider (use a custom provider name so we can set
             # stream_idle_timeout_ms -- built-in providers can't be overridden)
