@@ -45,7 +45,10 @@ from inspect_swe._claude_code._events.stream import (
     claude_code_event_stream,
 )
 from inspect_swe._util.centaur import CentaurOptions, run_centaur
-from inspect_swe._util.mcp_ready import wait_for_mcp_endpoints
+from inspect_swe._util.mcp_ready import (
+    DEFAULT_MCP_READY_TIMEOUT,
+    wait_for_mcp_endpoints,
+)
 from inspect_swe._util.path import join_path
 from inspect_swe._util.websearch import web_search_tool_disallowed
 
@@ -61,6 +64,7 @@ from .model import resolve_claude_code_models
 ClaudeCodePermissionMode = Literal[
     "acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"
 ]
+ClaudeCodeEffort = Literal["low", "medium", "high", "xhigh", "max"]
 
 
 class ClaudeCodeDeprecatedArgs(TypedDict, total=False):
@@ -119,12 +123,15 @@ def claude_code(
     skills: Sequence[str | Path | Skill] | None = None,
     mcp_servers: Sequence[MCPServerConfig] | None = None,
     bridged_tools: Sequence[BridgedToolsSpec] | None = None,
+    mcp_ready_timeout: float = DEFAULT_MCP_READY_TIMEOUT,
     disallowed_tools: list[str] | None = None,
     centaur: bool | CentaurOptions = False,
     attempts: int | AgentAttempts = 1,
     model: str | None = None,
     model_config: str | None = None,
+    effort: ClaudeCodeEffort | None = None,
     model_aliases: dict[str, str | Model] | None = None,
+    transparent_proxy: bool = False,
     opus_model: str | None = None,
     sonnet_model: str | None = None,
     haiku_model: str | None = None,
@@ -141,6 +148,7 @@ def claude_code(
     debug: bool | None = None,
     replace_system_prompt: str | None = None,
     allowlist_mcp_tools: bool = True,
+    allowlist_bridged_tools: bool = True,
     **deprecated_args: Unpack[ClaudeCodeDeprecatedArgs],
 ) -> Agent:
     """Claude Code agent.
@@ -166,6 +174,8 @@ def claude_code(
         bridged_tools: Host-side Inspect tools to expose to the agent via MCP.
             Each BridgedToolsSpec creates an MCP server that makes the specified
             tools available to the agent running in the sandbox.
+        mcp_ready_timeout: Seconds to wait for bridged MCP endpoints to serve
+            tools before the agent launch errors.
         disallowed_tools: List of tool names to disallow entirely (disallowing
             `"WebSearch"` also disables web search for the agent).
         centaur: Run in 'centaur' mode, which makes Claude Code available to an Inspect `human_cli()` agent rather than running it unattended.
@@ -179,9 +189,21 @@ def claude_code(
             bridged to the served Inspect model regardless. (Claude Code renders
             the genuine name/cutoff for recognized Anthropic ids and shows other
             ids verbatim.)
+        effort: Claude Code reasoning effort. ``None`` leaves the CLI default.
         model_aliases: Optional mapping of model names to Model instances or model name strings.
             Allows using custom Model implementations (e.g., wrapped Agents) instead of standard models.
             When a model name in the mapping is referenced, the corresponding Model/string is used.
+        transparent_proxy: Run the bridge as a faithful transparent proxy (defaults
+            to `False`). When `True`, each request is routed to the model the agent
+            actually asked for -- no alias table and no fallback collapse onto the
+            session model -- and the client's generation parameters are treated as
+            authoritative. Required when the agent makes internal model calls of its
+            own that must reach their real provider model rather than being served by
+            the session model, e.g. Claude Code's auto-mode security classifier under
+            `auto_mode=True`. With the default `False`, the presented-identity aliases
+            and the fallback model collapse such a request onto the session model, so
+            the classifier is served by the wrong model (and its generation parameters,
+            e.g. `max_tokens`, are dropped).
         opus_model: The model to use for `opus`, or for `opusplan` when Plan Mode is active. Defaults to `model`.
         sonnet_model: The model to use for `sonnet`, or for `opusplan` when Plan Mode is not active. Defaults to `model`.
         haiku_model: The model to use for haiku, or [background functionality](https://code.claude.com/docs/en/costs#background-token-usage). Defaults to `model`.
@@ -214,8 +236,23 @@ def claude_code(
             mode except `"bypassPermissions"`: in unattended runs, excluded
             static tools are denied without prompting. Set `False` with
             `permission_mode="auto"` when Claude Code's first-party classifier
-            should adjudicate those tools. Bridged Inspect tools remain allowlisted
-            because an evaluation may depend on them being callable.
+            should adjudicate those tools. Bridged Inspect tools are governed
+            separately by `allowlist_bridged_tools`.
+        allowlist_bridged_tools: Whether to add bridged Inspect tools to
+            `--allowed-tools` (default `True`, preserving the behavior every
+            existing caller gets). Bridged tools are allowlisted by default
+            because an evaluation may depend on them being callable, and in
+            every mode except `"auto"` a tool left off `--allowed-tools` is
+            denied without prompting in an unattended run.
+
+            Set `False` ONLY with `permission_mode="auto"`, where an excluded
+            tool is adjudicated by the classifier rather than denied. This is
+            required for an evaluation that measures Claude Code's own auto-mode
+            classifier acting on bridged tools: an allow rule resolves at step 1
+            of the permission flow, BEFORE the classifier, so an allowlisted
+            bridged call is never reviewed. Left `True` under `"auto"`, a run
+            whose entire tool surface is bridged produces ZERO adjudications and
+            looks clean while being wholly unreviewed.
         **deprecated_args: Supports the deprecated `auto_mode` argument. Set
             `auto_mode=True` maps to `permission_mode="auto"`.
     """
@@ -277,8 +314,9 @@ def claude_code(
             checkpointer() as cp,
             sandbox_agent_bridge(
                 state,
-                model=models.bridge_model,
-                model_aliases=models.aliases,
+                model=None if transparent_proxy else models.bridge_model,
+                model_aliases=None if transparent_proxy else models.aliases,
+                forward_generation_config=transparent_proxy,
                 filter=filter,
                 sandbox=sandbox,
                 retry_refusals=retry_refusals,
@@ -311,11 +349,7 @@ def claude_code(
                 if effective_permission_mode is not None
                 else ["--dangerously-skip-permissions"]
             )
-            cmd = [
-                *permission_flag,
-                "--model",
-                models.presented,
-            ]
+            cmd = claude_code_command(permission_flag, models.presented, effort)
 
             # add interactive options if not running as centaur
             if centaur is False:
@@ -345,6 +379,7 @@ def claude_code(
                         static_mcp_servers,
                         bridged_mcp_servers,
                         allowlist_mcp_tools,
+                        allowlist_bridged_tools,
                     )
                 )
 
@@ -389,7 +424,11 @@ def claude_code(
             # per-attempt gate below covers unattended retries after that.
             if http_mcp_configs:
                 await wait_for_mcp_endpoints(
-                    http_mcp_configs, bridge, sandbox=sandbox, required=True
+                    http_mcp_configs,
+                    bridge,
+                    sandbox=sandbox,
+                    timeout=mcp_ready_timeout,
+                    required=True,
                 )
 
             # centaur mode uses human_cli with custom instructions and bash rc
@@ -468,7 +507,11 @@ def claude_code(
                         is_retry = attempt_count > 0 or uncaught_error_count > 0
                         if http_mcp_configs and is_retry:
                             await wait_for_mcp_endpoints(
-                                http_mcp_configs, bridge, sandbox=sandbox, required=True
+                                http_mcp_configs,
+                                bridge,
+                                sandbox=sandbox,
+                                timeout=mcp_ready_timeout,
+                                required=True,
                             )
 
                         # launch Claude Code in streaming mode; drain stdout in
@@ -603,6 +646,18 @@ def _system_prompt_args(
     return args
 
 
+def claude_code_effort_args(effort: ClaudeCodeEffort | None) -> list[str]:
+    if effort is None:
+        return []
+    return ["--effort", effort]
+
+
+def claude_code_command(
+    permission_flag: list[str], model: str, effort: ClaudeCodeEffort | None
+) -> list[str]:
+    return [*permission_flag, "--model", model, *claude_code_effort_args(effort)]
+
+
 async def _seed_claude_config(
     sbox: Any,
     api_key: str,
@@ -654,13 +709,18 @@ def resolve_allowed_mcp_tools(
     static_mcp_servers: Sequence[MCPServerConfig],
     bridged_mcp_servers: Sequence[MCPServerConfig],
     allowlist_mcp_tools: bool,
+    allowlist_bridged_tools: bool = True,
 ) -> list[str]:
     static_allowed_tools = (
         resolve_mcp_server_allowed_tools(static_mcp_servers)
         if allowlist_mcp_tools
         else []
     )
-    bridged_allowed_tools = resolve_mcp_server_allowed_tools(bridged_mcp_servers)
+    bridged_allowed_tools = (
+        resolve_mcp_server_allowed_tools(bridged_mcp_servers)
+        if allowlist_bridged_tools
+        else []
+    )
     return [*static_allowed_tools, *bridged_allowed_tools]
 
 

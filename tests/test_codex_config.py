@@ -6,15 +6,23 @@ from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_swe import codex_cli, interactive_codex_cli
 from inspect_swe._codex_cli.config import (
     GUARDIAN_MODEL_SLUG,
+    CodexApprovalPolicy,
     CodexAutoReview,
+    CodexSandboxMode,
     check_codex_auto_review_version,
     codex_cli_config_overrides,
     codex_config_options,
     codex_mcp_server_config,
+    codex_mcp_server_toml,
+    codex_network_access_args,
+    codex_sandbox_args,
+    resolve_codex_approval_policy,
     resolve_codex_auto_review,
     resolve_codex_auto_review_model_aliases,
     resolve_codex_deprecated_args,
+    resolve_codex_sandbox_mode,
     resolve_codex_web_search,
+    validate_codex_bool_arg,
 )
 from inspect_swe._util.toml import to_toml
 
@@ -261,3 +269,267 @@ def test_static_mcp_server_is_not_marked_required() -> None:
     config = codex_mcp_server_config(server, {"bridged-tools"})
 
     assert "required" not in config
+
+
+def test_bridged_mcp_server_gets_the_startup_timeout() -> None:
+    server = MCPServerConfigHTTP(
+        type="http", name="bridged-tools", url="http://localhost:9000/mcp"
+    )
+
+    config = codex_mcp_server_config(server, {"bridged-tools"})
+
+    assert config["startup_timeout_sec"] == 300
+
+
+def test_static_mcp_server_keeps_codex_default_startup_timeout() -> None:
+    server = MCPServerConfigHTTP(
+        type="http", name="caller-tools", url="http://localhost:9001/mcp"
+    )
+
+    config = codex_mcp_server_config(server, {"bridged-tools"})
+
+    assert "startup_timeout_sec" not in config
+
+
+def test_bridged_mcp_server_accepts_an_explicit_startup_timeout() -> None:
+    server = MCPServerConfigHTTP(
+        type="http", name="bridged-tools", url="http://localhost:9000/mcp"
+    )
+
+    config = codex_mcp_server_config(server, {"bridged-tools"}, 60)
+
+    assert config["startup_timeout_sec"] == 60
+
+
+def test_codex_mcp_server_toml_sets_approve_when_never() -> None:
+    dump = {"type": "http", "url": "http://localhost:8901/mcp/taiga-mcp"}
+    result = codex_mcp_server_toml(dump, "never")
+    assert result == {
+        "type": "http",
+        "url": "http://localhost:8901/mcp/taiga-mcp",
+        "default_tools_approval_mode": "approve",
+    }
+
+
+def test_codex_mcp_server_toml_leaves_other_policies_untouched() -> None:
+    dump = {"type": "http", "url": "http://localhost:8901/mcp/taiga-mcp"}
+    for policy in ("untrusted", "on-request"):
+        assert codex_mcp_server_toml(dump, policy) == dump
+
+
+def test_codex_mcp_server_toml_does_not_mutate_input() -> None:
+    dump = {"type": "http", "url": "http://localhost:8901/mcp/taiga-mcp"}
+    codex_mcp_server_toml(dump, "never")
+    assert "default_tools_approval_mode" not in dump
+
+
+def test_config_override_resolves_effective_approval_policy() -> None:
+    assert (
+        resolve_codex_approval_policy("on-request", {"approval_policy": "never"})
+        == "never"
+    )
+
+
+def test_config_override_rejects_unknown_approval_policy() -> None:
+    with pytest.raises(ValueError, match="approval_policy"):
+        resolve_codex_approval_policy("never", {"approval_policy": "always"})
+
+
+def test_resolve_codex_sandbox_mode_prefers_override() -> None:
+    assert (
+        resolve_codex_sandbox_mode("danger-full-access", {"sandbox_mode": "read-only"})
+        == "read-only"
+    )
+    assert resolve_codex_sandbox_mode("workspace-write", None) == "workspace-write"
+
+
+def test_resolve_codex_sandbox_mode_validates_both_paths() -> None:
+    with pytest.raises(ValueError):
+        resolve_codex_sandbox_mode("readonly", None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        resolve_codex_sandbox_mode("danger-full-access", {"sandbox_mode": "nope"})
+
+
+def test_config_override_sandbox_mode_never_emits_bypass() -> None:
+    """A caller who asked for a restricted sandbox must never get the bypass flag.
+
+    Previously `config_overrides={"sandbox_mode": "read-only"}` with the default
+    argument emitted `--dangerously-bypass-approvals-and-sandbox` alongside
+    `-c sandbox_mode=read-only`, silently granting no sandbox at all.
+    """
+    effective = resolve_codex_sandbox_mode(
+        "danger-full-access", {"sandbox_mode": "read-only"}
+    )
+    args = codex_sandbox_args(effective, "never", True)
+    assert "--dangerously-bypass-approvals-and-sandbox" not in args
+    assert args[:2] == ["--sandbox", "read-only"]
+
+
+def test_resolve_codex_approval_policy_validates_argument() -> None:
+    with pytest.raises(ValueError):
+        resolve_codex_approval_policy("on_request", None)  # type: ignore[arg-type]
+
+
+def test_validate_codex_bool_arg() -> None:
+    assert validate_codex_bool_arg("network_access", True) is True
+    assert validate_codex_bool_arg("network_access", False) is False
+    with pytest.raises(ValueError, match="network_access must be a bool"):
+        validate_codex_bool_arg("network_access", "nope")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["false", "true", "", 0, 1, None])
+def test_validate_codex_bool_arg_rejects_non_bools(value: object) -> None:
+    """Truthy and falsy non-bools alike must be rejected, not coerced.
+
+    Agent kwargs arrive from task configs and `-S` args as arbitrary values, so
+    the string `"false"` is truthy and would otherwise select the opposite of
+    what the caller wrote.
+    """
+    with pytest.raises(ValueError, match="approve_static_mcp_tools must be a bool"):
+        validate_codex_bool_arg("approve_static_mcp_tools", value)  # type: ignore[arg-type]
+
+
+def test_headless_non_never_policy_raises_without_reviewer() -> None:
+    """Headless prompting policies fail fast.
+
+    `codex exec` hard-overrides the runtime policy to `never`; a prompting
+    policy without an approvals reviewer would silently cancel every bridged
+    tool call.
+    """
+    from inspect_swe import codex_cli
+
+    with pytest.raises(ValueError, match="headless"):
+        codex_cli(approval_policy="on-request")
+    # supported paths do not raise
+    codex_cli(approval_policy="on-request", centaur=True)
+    codex_cli(
+        approval_policy="on-request",
+        config_overrides={"approvals_reviewer": '"auto_review"'},
+    )
+    codex_cli()  # default never is fine
+
+
+def test_static_mcp_server_toml_opt_in_path() -> None:
+    """The static-server opt-in reuses the bridged helper.
+
+    Approve under effective `never`, untouched otherwise.
+    """
+    dump = {"type": "http", "url": "http://localhost:9/mcp/x"}
+    assert codex_mcp_server_toml(dump, "never")["default_tools_approval_mode"] == (
+        "approve"
+    )
+    assert codex_mcp_server_toml(dump, "on-request") == dump
+
+
+@pytest.mark.parametrize(
+    ("sandbox_mode", "approval_policy", "network_access", "expected"),
+    [
+        (
+            "danger-full-access",
+            "never",
+            True,
+            ["--dangerously-bypass-approvals-and-sandbox"],
+        ),
+        (
+            "read-only",
+            "never",
+            True,
+            ["--sandbox", "read-only", "-c", "approval_policy=never"],
+        ),
+        (
+            "workspace-write",
+            "on-request",
+            False,
+            [
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "approval_policy=on-request",
+                "-c",
+                "sandbox_workspace_write.network_access=false",
+            ],
+        ),
+        (
+            "workspace-write",
+            "never",
+            True,
+            [
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "approval_policy=never",
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+            ],
+        ),
+    ],
+)
+def test_codex_sandbox_args(
+    sandbox_mode: CodexSandboxMode,
+    approval_policy: CodexApprovalPolicy,
+    network_access: bool,
+    expected: list[str],
+) -> None:
+    assert codex_sandbox_args(sandbox_mode, approval_policy, network_access) == expected
+
+
+def test_codex_network_access_args_spellings() -> None:
+    """`-c` values are parsed as TOML: Python's `True` capitalisation is invalid."""
+    assert codex_network_access_args(True) == [
+        "-c",
+        "sandbox_workspace_write.network_access=true",
+    ]
+    assert codex_network_access_args(False) == [
+        "-c",
+        "sandbox_workspace_write.network_access=false",
+    ]
+
+
+@pytest.mark.parametrize("network_access", [True, False])
+def test_codex_sandbox_args_auto_review_emits_network_access(
+    network_access: bool,
+) -> None:
+    """auto_review must still honor `network_access`.
+
+    auto_review selects `workspace-write` through its own final `-c` overrides,
+    so no `--sandbox` or bypass flag may be emitted here -- but omitting the
+    network args entirely left Codex's own default (`false`) in effect and
+    silently discarded the caller's setting, including the documented `True`.
+    """
+    args = codex_sandbox_args(
+        "workspace-write", "on-request", network_access, auto_review=True
+    )
+    assert args == codex_network_access_args(network_access)
+    assert "--sandbox" not in args
+    assert "--dangerously-bypass-approvals-and-sandbox" not in args
+    assert not any(arg.startswith("approval_policy=") for arg in args)
+
+
+def test_codex_sandbox_args_auto_review_never_emits_mode_or_policy() -> None:
+    # auto_review rejects an explicit sandbox_mode/approval_policy at
+    # construction, so the defaults are what reach this function; neither may
+    # leak into the args and outrank auto_review's own -c overrides.
+    assert codex_sandbox_args(
+        "danger-full-access", "never", True, auto_review=True
+    ) == codex_network_access_args(True)
+
+
+def test_codex_cli_rejects_non_bool_approve_static_mcp_tools() -> None:
+    """`approve_static_mcp_tools="false"` is truthy and must not be coerced.
+
+    Agent kwargs arrive from task configs and `-S` args as arbitrary strings, so
+    an unvalidated `"false"` would pre-approve every static MCP tool call under
+    the default `never` policy -- the opposite of the caller's opt-out.
+    """
+    with pytest.raises(ValueError, match="approve_static_mcp_tools must be a bool"):
+        codex_cli(approve_static_mcp_tools="false")  # type: ignore[arg-type]
+    # real booleans are accepted
+    codex_cli(approve_static_mcp_tools=True)
+    codex_cli(approve_static_mcp_tools=False)
+
+
+def test_codex_cli_validates_network_access_and_allows_it_with_auto_review() -> None:
+    with pytest.raises(ValueError, match="network_access must be a bool"):
+        codex_cli(network_access="false")  # type: ignore[arg-type]
+    codex_cli(auto_review=True, network_access=False)
+    codex_cli(auto_review=True, network_access=True)
