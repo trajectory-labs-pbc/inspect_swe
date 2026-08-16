@@ -29,6 +29,10 @@ from inspect_ai.util import sandbox as sandbox_env
 from inspect_ai.util import store
 from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
+from inspect_swe._util.mcp_ready import (
+    DEFAULT_MCP_READY_TIMEOUT,
+    wait_for_mcp_endpoints,
+)
 from inspect_swe._util.messages import build_user_prompt
 from inspect_swe._util.path import join_path
 from inspect_swe._util.sandbox import resolve_agent_cwd
@@ -260,6 +264,7 @@ def antigravity(
     system_prompt: str | None = None,
     mcp_servers: Sequence[MCPServerConfig] | None = None,
     bridged_tools: Sequence[BridgedToolsSpec] | None = None,
+    mcp_ready_timeout: float = DEFAULT_MCP_READY_TIMEOUT,
     model: str | None = None,
     model_aliases: dict[str, str | Model] | None = None,
     filter: _ModelGenerateFilter | None = None,
@@ -286,6 +291,8 @@ def antigravity(
         mcp_servers: MCP servers to make available to the agent (HTTP configs;
             localharness reaches servers over streamable HTTP).
         bridged_tools: Host-side Inspect tools to expose to the agent via MCP.
+        mcp_ready_timeout: Seconds to wait for bridged MCP endpoints to serve
+            tools before the agent launch errors.
         model: Model name to use for the inspect bridge (defaults to the task model).
         model_aliases: Optional mapping of model names to Model instances/strings.
             Alias keys resolve against the client-sent model name, which for this
@@ -347,6 +354,27 @@ def antigravity(
             server_entries = _mcp_server_entries(
                 [*(mcp_servers or []), *bridge.mcp_server_configs]
             )
+
+            # Gate the launch on the bridged MCP endpoints actually serving a
+            # tool listing. The SDK reads its MCP config once at startup while
+            # the bridge proxy comes up asynchronously, so launching early
+            # yields an agent with no environment tools and NO error -- a
+            # toolless trajectory that scores as an ordinary one. Raises if the
+            # endpoints never come up. Static caller-provided servers are the
+            # caller's contract and are not gated, mirroring gemini_cli.
+            bridged_http_configs = [
+                config
+                for config in bridge.mcp_server_configs
+                if isinstance(config, MCPServerConfigHTTP)
+            ]
+            if bridged_http_configs:
+                await wait_for_mcp_endpoints(
+                    bridged_http_configs,
+                    bridge,
+                    sandbox=sandbox,
+                    timeout=mcp_ready_timeout,
+                    required=True,
+                )
 
             prompt, has_assistant_response = build_user_prompt(state.messages)
             system_messages = [
