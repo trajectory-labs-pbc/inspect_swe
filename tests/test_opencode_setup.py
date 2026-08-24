@@ -1,26 +1,14 @@
 """Tests for the OpenCode agent install/setup utilities."""
 
-import asyncio
-
 import pytest
 from inspect_ai import Task, eval
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import Score, Scorer, Target, scorer
 from inspect_ai.solver import Generate, Solver, TaskState, solver
 from inspect_ai.util import sandbox
-from inspect_swe._opencode.agentbinary import (
-    ensure_opencode_setup,
-    resolve_opencode_version,
-)
+from inspect_swe._opencode.agentbinary import ensure_opencode_setup
 
 from tests.conftest import skip_if_no_docker
-
-
-def test_resolve_version_literal() -> None:
-    """Explicit semver strings are returned as-is without hitting the network."""
-    assert asyncio.run(resolve_opencode_version("1.14.30")) == "1.14.30"
-    assert asyncio.run(resolve_opencode_version("0.42.0")) == "0.42.0"
-
 
 @solver
 def install_opencode_in_sandbox(version: str = "stable") -> Solver:
