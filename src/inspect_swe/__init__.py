@@ -1,4 +1,6 @@
 from ._antigravity.antigravity import antigravity
+from ._antigravity_cli.agentbinary import antigravity_cli_binary_source
+from ._antigravity_cli.antigravity_cli import antigravity_cli
 from ._claude_code.agentbinary import claude_code_binary_source
 from ._claude_code.claude_code import claude_code
 from ._codex_cli.agentbinary import codex_cli_binary_source
@@ -30,6 +32,8 @@ __all__ = [
     "acp_connection",
     "bridge_mcp_to_acp",
     "antigravity",
+    "antigravity_cli",
+    "antigravity_cli_binary_source",
     "claude_code_binary_source",
     "claude_code",
     "codex_cli_binary_source",
