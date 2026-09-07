@@ -27,7 +27,6 @@ from inspect_ai.tool import MCPServerConfig, ToolChoice, ToolInfo
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.util import sandbox as sandbox_env
 from inspect_ai.util import store
-from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from inspect_swe._util.mcp_ready import (
     DEFAULT_MCP_READY_TIMEOUT,
@@ -35,7 +34,12 @@ from inspect_swe._util.mcp_ready import (
 )
 from inspect_swe._util.messages import build_user_prompt
 from inspect_swe._util.path import join_path
-from inspect_swe._util.sandbox import resolve_agent_cwd
+from inspect_swe._util.poll_timeout_recovery import poll_timeout_recovery_bridge_args
+from inspect_swe._util.sandbox import (
+    DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
+    resolve_agent_cwd,
+    run_unattended_agent,
+)
 from inspect_swe._util.trace import trace
 
 from .agentbinary import ensure_antigravity_sdk
@@ -275,6 +279,9 @@ def antigravity(
     version: str = "0.1.7",
     endpoint_model: str = _DEFAULT_ENDPOINT_MODEL,
     debug: bool | None = None,
+    exec_timeout: float | None = DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
+    *,
+    poll_timeout_recovery: float | None = None,
 ) -> Agent:
     """Google Antigravity SDK agent.
 
@@ -310,8 +317,18 @@ def antigravity(
             already present in the sandbox image.
         endpoint_model: Model name the SDK client presents to the bridge endpoint.
         debug: Trace the full runner output.
+        exec_timeout: Wall-time limit in seconds for each unattended Antigravity
+            invocation. Defaults to 30 minutes; an invocation that exceeds it is
+            terminated. `0` times out immediately; `None` disables the deadline.
+        poll_timeout_recovery: Seconds the model bridge keeps re-polling its
+            proxy server after a poll of it times out, instead of failing the
+            sample (`sandbox_agent_bridge(poll_timeout_recovery=...)`). Defaults
+            to `None`, which leaves the bridge's own behavior unchanged. Setting
+            it requires an inspect-ai whose `sandbox_agent_bridge` accepts
+            `poll_timeout_recovery`, and otherwise raises `RuntimeError`.
     """
     bridge_model = f"inspect/{model}" if model else "inspect"
+    bridge_recovery_args = poll_timeout_recovery_bridge_args(poll_timeout_recovery)
 
     async def execute(state: AgentState) -> AgentState:
         bridge_port = store().get(_BRIDGE_PORT_KEY, 3000) + 1
@@ -329,6 +346,7 @@ def antigravity(
             # granted unconditionally to preserve today's behaviour; a grant is
             # inert unless the CLI declares a native web tool
             web_search=True,
+            **bridge_recovery_args,
         ) as bridge:
             sbox = sandbox_env(sandbox)
 
@@ -440,15 +458,14 @@ def antigravity(
                 home=sandbox_home,
                 user=user,
             )
-            result = await sbox.exec_remote(
-                cmd=spec.command,
-                options=ExecRemoteAwaitableOptions(
-                    concurrency=False,
-                    cwd=spec.cwd,
-                    env=spec.env,
-                    user=spec.user,
-                ),
-                stream=False,
+            result = await run_unattended_agent(
+                sbox,
+                spec.command,
+                cwd=spec.cwd,
+                env=spec.env,
+                user=spec.user,
+                timeout=exec_timeout,
+                agent_name="Antigravity",
             )
             if debug:
                 trace(

@@ -26,7 +26,6 @@ from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.util import SandboxEnvironment, store
 from inspect_ai.util import sandbox as sandbox_env
-from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from inspect_swe._util._async import is_callable_coroutine
 from inspect_swe._util.centaur import (
@@ -40,7 +39,12 @@ from inspect_swe._util.mcp_ready import (
     wait_for_mcp_endpoints,
 )
 from inspect_swe._util.messages import build_user_prompt
-from inspect_swe._util.sandbox import resolve_agent_cwd
+from inspect_swe._util.poll_timeout_recovery import poll_timeout_recovery_bridge_args
+from inspect_swe._util.sandbox import (
+    DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
+    resolve_agent_cwd,
+    run_unattended_agent,
+)
 from inspect_swe._util.trace import trace
 
 from .._util.inspect_compat import BRIDGE_REQUEST_HEADERS
@@ -179,6 +183,7 @@ def opencode(
     opencode_model: str = "anthropic/claude-sonnet-4-5",
     filter: GenerateFilter | None = None,
     retry_refusals: int | None = None,
+    exec_timeout: float | None = DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     user: str | None = None,
@@ -191,6 +196,7 @@ def opencode(
     model_resolver: ModelResolver | None = None,
     accumulate_conversations: bool = False,
     config_dependency_seed: str | None = None,
+    poll_timeout_recovery: float | None = None,
 ) -> Agent:
     """OpenCode agent.
 
@@ -229,6 +235,9 @@ def opencode(
             client OpenCode uses to format the request.
         filter: Filter for intercepting bridged model requests
         retry_refusals: Should refusals be retried? (pass number of times to retry)
+        exec_timeout: Wall-time limit in seconds for each unattended OpenCode
+            invocation. Defaults to 30 minutes; an invocation that exceeds it is
+            terminated. `0` times out immediately; `None` disables the deadline.
         cwd: Working directory to run opencode within
         env: Environment variables to set for opencode
         user: User to execute opencode with
@@ -242,6 +251,12 @@ def opencode(
         config_dependency_seed: Absolute sandbox directory with the exact CLI
             version's OpenCode config dependency package metadata and production
             node_modules. When omitted, provision an equivalent host-cached seed.
+        poll_timeout_recovery: Seconds the model bridge keeps re-polling its
+            proxy server after a poll of it times out, instead of failing the
+            sample (`sandbox_agent_bridge(poll_timeout_recovery=...)`). Defaults
+            to `None`, which leaves the bridge's own behavior unchanged. Setting
+            it requires an inspect-ai whose `sandbox_agent_bridge` accepts
+            `poll_timeout_recovery`, and otherwise raises `RuntimeError`.
     """
     # resolve centaur
     if centaur is True:
@@ -269,6 +284,8 @@ def opencode(
         provider_id = "anthropic"
         provider_model_id = opencode_model
 
+    bridge_recovery_args = poll_timeout_recovery_bridge_args(poll_timeout_recovery)
+
     async def execute(state: AgentState) -> AgentState:
         # determine port (use new port for each execution of agent on sample)
         MODEL_PORT = "opencode_model_port"
@@ -295,6 +312,7 @@ def opencode(
                 "x-parent-session-id",
             ),
             model_event_sink=consumer,
+            **bridge_recovery_args,
         ) as bridge:
             # resolve sandbox
             sbox = sandbox_env(sandbox)
@@ -524,16 +542,14 @@ def opencode(
                             required=True,
                         )
 
-                    result = await sbox.exec_remote(
-                        cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
-                        + agent_cmd,
-                        options=ExecRemoteAwaitableOptions(
-                            cwd=agent_cwd,
-                            env=agent_env,
-                            user=user,
-                            concurrency=False,
-                        ),
-                        stream=False,
+                    result = await run_unattended_agent(
+                        sbox,
+                        ["bash", "-c", 'exec 0</dev/null; "$@"', "bash"] + agent_cmd,
+                        cwd=agent_cwd,
+                        env=agent_env,
+                        user=user,
+                        timeout=exec_timeout,
+                        agent_name="OpenCode",
                     )
                     await refresh("opencode execution")
 

@@ -44,7 +44,6 @@ from inspect_ai.tool import (
 )
 from inspect_ai.util import sandbox as sandbox_env
 from inspect_ai.util import store
-from inspect_ai.util._sandbox import ExecRemoteAwaitableOptions
 
 from inspect_swe._util._async import is_callable_coroutine
 from inspect_swe._util.centaur import (
@@ -58,10 +57,15 @@ from inspect_swe._util.mcp_ready import (
     wait_for_mcp_endpoints,
 )
 from inspect_swe._util.messages import build_user_prompt
+from inspect_swe._util.poll_timeout_recovery import poll_timeout_recovery_bridge_args
 from inspect_swe._util.trace import trace
 
 from .._util.agentbinary import ensure_agent_binary_installed
-from .._util.sandbox import resolve_agent_cwd
+from .._util.sandbox import (
+    DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
+    resolve_agent_cwd,
+    run_unattended_agent,
+)
 from .._util.toml import _format_value
 from .agentbinary import kimi_code_binary_source
 
@@ -129,6 +133,7 @@ def kimi_code(
     model_aliases: dict[str, str | Model] | None = None,
     filter: GenerateFilter | None = None,
     retry_refusals: int | None = None,
+    exec_timeout: float | None = DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
     disallowed_tools: Sequence[str] | None = None,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
@@ -140,6 +145,7 @@ def kimi_code(
     commands_filter: CommandsFilter | None = None,
     model_resolver: ModelResolver | None = None,
     accumulate_conversations: bool = False,
+    poll_timeout_recovery: float | None = None,
 ) -> Agent:
     """Kimi Code agent.
 
@@ -179,6 +185,9 @@ def kimi_code(
         model_aliases: Optional mapping of model names to Model instances or model name strings.
         filter: Filter for intercepting bridged model requests
         retry_refusals: Should refusals be retried? (pass number of times to retry)
+        exec_timeout: Wall-time limit in seconds for each unattended Kimi Code
+            invocation. Defaults to 30 minutes; an invocation that exceeds it is
+            terminated. `0` times out immediately; `None` disables the deadline.
         disallowed_tools: Tool names to deny via Kimi permission rules
         cwd: Working directory to run kimi within
         env: Environment variables to set for kimi
@@ -190,6 +199,12 @@ def kimi_code(
             - "stable"/"latest": Download and use the latest version
             - "x.x.x": Download and use a specific version
         debug: Trace all debug output.
+        poll_timeout_recovery: Seconds the model bridge keeps re-polling its
+            proxy server after a poll of it times out, instead of failing the
+            sample (`sandbox_agent_bridge(poll_timeout_recovery=...)`). Defaults
+            to `None`, which leaves the bridge's own behavior unchanged. Setting
+            it requires an inspect-ai whose `sandbox_agent_bridge` accepts
+            `poll_timeout_recovery`, and otherwise raises `RuntimeError`.
     """
     # resolve centaur
     if centaur is True:
@@ -207,6 +222,7 @@ def kimi_code(
 
     resolved_disallowed = list(disallowed_tools or [])
     filter_is_legacy = filter is not None and _is_legacy_str_filter(filter)
+    bridge_recovery_args = poll_timeout_recovery_bridge_args(poll_timeout_recovery)
 
     async def execute(state: AgentState) -> AgentState:
         resolved_model = _resolve_model(model=model, model_aliases=model_aliases)
@@ -261,6 +277,7 @@ def kimi_code(
             web_search=True,
             model_resolver=model_resolver,
             accumulate_conversations=accumulate_conversations,
+            **bridge_recovery_args,
         ) as bridge:
             # resolve sandbox
             sbox = sandbox_env(sandbox)
@@ -395,16 +412,14 @@ def kimi_code(
                     # BLOCKING_MCP_ENV and codex via required=true; kimi has
                     # no equivalent knob.
 
-                    result = await sbox.exec_remote(
-                        cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
-                        + agent_cmd,
-                        options=ExecRemoteAwaitableOptions(
-                            cwd=agent_cwd,
-                            env=agent_env,
-                            user=user,
-                            concurrency=False,
-                        ),
-                        stream=False,
+                    result = await run_unattended_agent(
+                        sbox,
+                        ["bash", "-c", 'exec 0</dev/null; "$@"', "bash"] + agent_cmd,
+                        cwd=agent_cwd,
+                        env=agent_env,
+                        user=user,
+                        timeout=exec_timeout,
+                        agent_name="Kimi Code",
                     )
 
                     if debug:
