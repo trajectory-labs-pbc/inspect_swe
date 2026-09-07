@@ -76,6 +76,30 @@ def test_cached_agent_binaries_lists_opencode(tmp_path: Path) -> None:
     assert [(b.agent, b.version) for b in cached] == [("opencode", "1.14.30")]
 
 
+def test_cached_agent_binaries_lists_antigravity_cli(tmp_path: Path) -> None:
+    from inspect_swe._antigravity_cli import agentbinary as antigravity_agentbinary
+
+    with patch.object(
+        antigravity_agentbinary, "package_cache_dir", return_value=tmp_path
+    ):
+        source = antigravity_agentbinary.antigravity_cli_binary_source()
+        for version in ("1.1.20", "1.1.27"):
+            source.cached_binary_path(version, "linux-x64").write_bytes(b"binary")
+
+        default_cached = cached_agent_binaries("antigravity_cli")
+        cached = cached_agent_binaries("antigravity_cli", quiet=True)
+
+    assert [(binary.agent, binary.version) for binary in cached] == [
+        ("antigravity_cli", "1.1.27"),
+        ("antigravity_cli", "1.1.20"),
+    ]
+    assert {binary.path.name for binary in cached} == {
+        "agy-1.1.27-linux-x64",
+        "agy-1.1.20-linux-x64",
+    }
+    assert cached == default_cached
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize(
     "version,platform",
