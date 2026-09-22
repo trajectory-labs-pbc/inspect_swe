@@ -95,6 +95,15 @@ ignore = ["E203", "E501", "D10", "D212", "D415"]
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
+[tool.uv.sources]
+# Dev-venv pairing only: uv does not apply a git dependency's sources
+# transitively, so consumers installing inspect-swe are unaffected. This pins
+# the fork inspect_ai this fork's runtime surface (bridge kwargs, human_cli
+# extensions) is written against; the import-time surface additionally
+# tolerates upstream inspect-ai (see _util/inspect_compat.py). Move the rev
+# deliberately with the inspect_ai fork release -- never track a branch name.
+inspect-ai = { git = "https://github.com/trajectory-labs-pbc/inspect_ai.git", rev = "8984b671da647ef278fe9bd86c3633c664773d6d" }
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
