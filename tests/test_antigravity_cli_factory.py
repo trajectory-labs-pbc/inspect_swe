@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Literal, cast, overload
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from inspect_ai.agent import AgentState
 from inspect_ai.model import (
     ChatMessage,
@@ -395,3 +396,152 @@ def test_unattended_reentry_resumes_only_the_seeded_native_conversation() -> Non
     command = sbox.remote_calls[0][0]
     assert command[command.index("--conversation") + 1] == _CID
     assert "--continue" not in command
+
+
+def _unattended_command(**factory_kwargs: object) -> list[str]:
+    """Run the unattended factory against the doubles and return the agy argv."""
+    module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
+    state = AgentState(messages=[])
+    sbox = _Sandbox()
+
+    @asynccontextmanager
+    async def bridge_context(
+        *_args: object, **kwargs: object
+    ) -> AsyncIterator[SimpleNamespace]:
+        sbox.state_filter = cast(
+            Callable[[Sequence[ChatMessage]], bool], kwargs["state_filter"]
+        )
+        yield SimpleNamespace(
+            port=8901, mcp_server_configs=[], bridged_tools={}, state=state
+        )
+
+    with (
+        patch.object(module, "sandbox_env", return_value=sbox),
+        patch.object(module, "store", return_value=_Store()),
+        patch.object(module, "resolve_agent_cwd", AsyncMock(return_value="/workspace")),
+        patch.object(module, "antigravity_cli_binary_source", lambda: object()),
+        patch.object(
+            module, "ensure_agent_binary_installed", AsyncMock(return_value="/opt/agy")
+        ),
+        patch.object(module, "sandbox_agent_bridge", bridge_context),
+        patch.object(module, "build_user_prompt", return_value=("write files", False)),
+    ):
+        asyncio.run(module.antigravity_cli(version="1.1.27", **factory_kwargs)(state))
+
+    assert len(sbox.remote_calls) == 1
+    return sbox.remote_calls[0][0][4:]
+
+
+def test_unattended_factory_can_run_under_the_cli_permission_policy() -> None:
+    assert _unattended_command(skip_permissions=False) == [
+        "/opt/agy",
+        "--model",
+        "gemini-3.6-flash",
+        "--effort",
+        "low",
+        "--disable-slash-commands",
+        "--output-format",
+        "json",
+        "--print",
+        "write files",
+    ]
+
+
+def test_unattended_factory_appends_extra_args_before_the_prompt() -> None:
+    assert _unattended_command(extra_args=["--sandbox", "--mode=plan"]) == [
+        "/opt/agy",
+        "--model",
+        "gemini-3.6-flash",
+        "--effort",
+        "low",
+        "--disable-slash-commands",
+        "--dangerously-skip-permissions",
+        "--output-format",
+        "json",
+        "--sandbox",
+        "--mode=plan",
+        "--print",
+        "write files",
+    ]
+
+
+def test_centaur_factory_hands_extra_args_to_the_session() -> None:
+    module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
+    state = AgentState(messages=[])
+    sbox = _Sandbox()
+    handed: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def bridge_context(
+        *_args: object, **_kwargs: object
+    ) -> AsyncIterator[SimpleNamespace]:
+        yield SimpleNamespace(
+            port=8901, mcp_server_configs=[], bridged_tools={}, state=state
+        )
+
+    async def capture_centaur(
+        options: CentaurOptions,
+        agy_cmd: list[str],
+        agent_env: dict[str, str],
+        session: CentaurSession,
+        commands_filter: CommandsFilter | None = None,
+    ) -> AgentState:
+        handed.update(command=agy_cmd, invocation=session.invocation)
+        return session.state
+
+    with (
+        patch.object(module, "sandbox_env", return_value=sbox),
+        patch.object(module, "store", return_value=_Store()),
+        patch.object(module, "resolve_agent_cwd", AsyncMock(return_value="/workspace")),
+        patch.object(module, "antigravity_cli_binary_source", lambda: object()),
+        patch.object(
+            module, "ensure_agent_binary_installed", AsyncMock(return_value="/opt/agy")
+        ),
+        patch.object(module, "sandbox_agent_bridge", bridge_context),
+        patch.object(module, "build_user_prompt", return_value=("write files", False)),
+        patch.object(module, "_run_antigravity_cli_centaur", capture_centaur),
+    ):
+        asyncio.run(
+            module.antigravity_cli(
+                centaur=CentaurOptions(),
+                version="1.1.27",
+                skip_permissions=False,
+                extra_args=["--sandbox"],
+            )(state)
+        )
+
+    expected = [
+        "/opt/agy",
+        "--model",
+        "gemini-3.6-flash",
+        "--effort",
+        "low",
+        "--sandbox",
+    ]
+    assert handed["command"] == expected
+    assert list(cast(Sequence[str], handed["invocation"])) == expected
+
+
+@pytest.mark.parametrize(
+    "owned",
+    [
+        "--print",
+        "-p",
+        "--conversation",
+        "--continue",
+        "--output-format=text",
+        "--model=other",
+        "--effort",
+        "--dangerously-skip-permissions",
+    ],
+)
+def test_extra_args_may_not_set_a_factory_owned_flag(owned: str) -> None:
+    module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
+    with pytest.raises(ValueError, match=owned.split("=", 1)[0]):
+        module.antigravity_cli(extra_args=["--sandbox", owned])
+
+
+def test_extra_args_must_be_a_sequence_of_arguments_not_one_string() -> None:
+    module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
+    with pytest.raises(TypeError, match="not a single string"):
+        module.antigravity_cli(extra_args="--sandbox")

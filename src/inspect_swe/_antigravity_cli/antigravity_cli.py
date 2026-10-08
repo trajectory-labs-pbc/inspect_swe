@@ -58,6 +58,45 @@ _MCP_CONFIG_DIR = ".gemini/config"
 _ONBOARDING_CACHE_DIR = f"{_SETTINGS_DIR}/cache"
 _ONBOARDING_FILE = f"{_ONBOARDING_CACHE_DIR}/onboarding.json"
 
+# Flags this factory sets itself. A caller's `extra_args` may not repeat them:
+# the output format is what the result parser reads, the conversation flags are
+# how a resume is pinned to its own conversation, and the model, effort and
+# permission choices each have their own parameter.
+_FACTORY_OWNED_FLAGS = frozenset(
+    {
+        "--print",
+        "-p",
+        "--prompt",
+        "--prompt-interactive",
+        "-i",
+        "--conversation",
+        "--continue",
+        "-c",
+        "--output-format",
+        "--input-format",
+        "--model",
+        "--effort",
+        "--dangerously-skip-permissions",
+    }
+)
+
+
+def _validated_extra_args(extra_args: Sequence[str] | None) -> list[str]:
+    """Return a caller's additional CLI arguments, refusing factory-owned flags."""
+    if extra_args is None:
+        return []
+    if isinstance(extra_args, str):
+        raise TypeError(
+            "extra_args must be a sequence of arguments, not a single string"
+        )
+    owned = sorted({arg.split("=", 1)[0] for arg in extra_args} & _FACTORY_OWNED_FLAGS)
+    if owned:
+        raise ValueError(
+            f"extra_args may not set {', '.join(owned)}: antigravity_cli() sets "
+            "these itself (use its model, effort and skip_permissions parameters)"
+        )
+    return list(extra_args)
+
 
 # The CLI states the identity of its own conversation in every primary request:
 # official 1.1.27/1.1.28 requests carry exactly one system
@@ -173,6 +212,8 @@ def antigravity_cli(
     model_resolver: ModelResolver | None = None,
     accumulate_conversations: bool = False,
     exec_timeout: float | None = DEFAULT_CLI_EXEC_TIMEOUT_SECONDS,
+    skip_permissions: bool = True,
+    extra_args: Sequence[str] | None = None,
     poll_timeout_recovery: float | None = None,
 ) -> Agent:
     """Antigravity CLI agent.
@@ -242,7 +283,19 @@ def antigravity_cli(
             to `None`, which leaves the bridge's own behavior unchanged. Setting
             it requires an inspect-ai whose `sandbox_agent_bridge` accepts
             `poll_timeout_recovery`, and otherwise raises `RuntimeError`.
+        skip_permissions: In unattended mode, pass `--dangerously-skip-permissions`
+            (the default). Pass `False` to run under the CLI's own permission
+            policy instead, for configurations that reject the flag. Without a
+            person to approve, a tool call the CLI declines to run is not run.
+            Ignored in centaur mode, where the human approves.
+        extra_args: Additional arguments appended to the `agy` command in both
+            unattended and centaur mode, for CLI options this factory has no
+            parameter for. Arguments the factory sets itself (`--print`,
+            `--conversation`, `--output-format`, `--model`, `--effort`,
+            `--dangerously-skip-permissions` and their aliases) raise `ValueError`.
     """
+    validated_extra_args = _validated_extra_args(extra_args)
+
     # resolve centaur
     if centaur is True:
         centaur = CentaurOptions()
@@ -369,11 +422,16 @@ def antigravity_cli(
                 cmd.extend(
                     [
                         "--disable-slash-commands",
-                        "--dangerously-skip-permissions",
+                        *(
+                            ["--dangerously-skip-permissions"]
+                            if skip_permissions
+                            else []
+                        ),
                         "--output-format",
                         "json",
                     ]
                 )
+            cmd.extend(validated_extra_args)
             agent_env = build_antigravity_agent_env(
                 bridge_port=bridge.port, sandbox_home=sandbox_home, env=env
             )
