@@ -89,6 +89,11 @@ def _validated_extra_args(extra_args: Sequence[str] | None) -> list[str]:
         raise TypeError(
             "extra_args must be a sequence of arguments, not a single string"
         )
+    if "--" in extra_args:
+        raise ValueError(
+            "extra_args may not contain '--': it would end option parsing before "
+            "the --conversation and --print flags antigravity_cli() appends"
+        )
     owned = sorted({arg.split("=", 1)[0] for arg in extra_args} & _FACTORY_OWNED_FLAGS)
     if owned:
         raise ValueError(
@@ -292,7 +297,8 @@ def antigravity_cli(
             unattended and centaur mode, for CLI options this factory has no
             parameter for. Arguments the factory sets itself (`--print`,
             `--conversation`, `--output-format`, `--model`, `--effort`,
-            `--dangerously-skip-permissions` and their aliases) raise `ValueError`.
+            `--dangerously-skip-permissions` and their aliases) and a standalone `--`
+            raise `ValueError`.
     """
     validated_extra_args = _validated_extra_args(extra_args)
 

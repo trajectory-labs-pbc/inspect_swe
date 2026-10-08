@@ -545,3 +545,9 @@ def test_extra_args_must_be_a_sequence_of_arguments_not_one_string() -> None:
     module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
     with pytest.raises(TypeError, match="not a single string"):
         module.antigravity_cli(extra_args="--sandbox")
+
+
+def test_extra_args_may_not_end_option_parsing() -> None:
+    module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
+    with pytest.raises(ValueError, match="end option parsing"):
+        module.antigravity_cli(extra_args=["--sandbox", "--"])
