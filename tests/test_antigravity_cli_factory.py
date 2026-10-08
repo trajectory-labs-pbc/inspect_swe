@@ -4,7 +4,7 @@ import asyncio
 import importlib
 import json
 from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import asynccontextmanager
+from contextlib import AbstractContextManager, ExitStack, asynccontextmanager
 from types import SimpleNamespace
 from typing import Literal, cast, overload
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -398,11 +398,14 @@ def test_unattended_reentry_resumes_only_the_seeded_native_conversation() -> Non
     assert "--continue" not in command
 
 
-def _unattended_command(**factory_kwargs: object) -> list[str]:
-    """Run the unattended factory against the doubles and return the agy argv."""
+def _run_factory(
+    sbox: _Sandbox,
+    *extra_patches: AbstractContextManager[object],
+    **factory_kwargs: object,
+) -> None:
+    """Run the factory once against the doubles, with any extra seams patched."""
     module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
     state = AgentState(messages=[])
-    sbox = _Sandbox()
 
     @asynccontextmanager
     async def bridge_context(
@@ -415,19 +418,30 @@ def _unattended_command(**factory_kwargs: object) -> list[str]:
             port=8901, mcp_server_configs=[], bridged_tools={}, state=state
         )
 
-    with (
+    seams: list[AbstractContextManager[object]] = [
         patch.object(module, "sandbox_env", return_value=sbox),
         patch.object(module, "store", return_value=_Store()),
         patch.object(module, "resolve_agent_cwd", AsyncMock(return_value="/workspace")),
         patch.object(module, "antigravity_cli_binary_source", lambda: object()),
         patch.object(
-            module, "ensure_agent_binary_installed", AsyncMock(return_value="/opt/agy")
+            module,
+            "ensure_agent_binary_installed",
+            AsyncMock(return_value="/opt/agy"),
         ),
         patch.object(module, "sandbox_agent_bridge", bridge_context),
         patch.object(module, "build_user_prompt", return_value=("write files", False)),
-    ):
+        *extra_patches,
+    ]
+    with ExitStack() as stack:
+        for seam in seams:
+            stack.enter_context(seam)
         asyncio.run(module.antigravity_cli(version="1.1.27", **factory_kwargs)(state))
 
+
+def _unattended_command(**factory_kwargs: object) -> list[str]:
+    """Run the unattended factory against the doubles and return the agy argv."""
+    sbox = _Sandbox()
+    _run_factory(sbox, **factory_kwargs)
     assert len(sbox.remote_calls) == 1
     return sbox.remote_calls[0][0][4:]
 
@@ -467,17 +481,7 @@ def test_unattended_factory_appends_extra_args_before_the_prompt() -> None:
 
 def test_centaur_factory_hands_extra_args_to_the_session() -> None:
     module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
-    state = AgentState(messages=[])
-    sbox = _Sandbox()
     handed: dict[str, object] = {}
-
-    @asynccontextmanager
-    async def bridge_context(
-        *_args: object, **_kwargs: object
-    ) -> AsyncIterator[SimpleNamespace]:
-        yield SimpleNamespace(
-            port=8901, mcp_server_configs=[], bridged_tools={}, state=state
-        )
 
     async def capture_centaur(
         options: CentaurOptions,
@@ -489,26 +493,13 @@ def test_centaur_factory_hands_extra_args_to_the_session() -> None:
         handed.update(command=agy_cmd, invocation=session.invocation)
         return session.state
 
-    with (
-        patch.object(module, "sandbox_env", return_value=sbox),
-        patch.object(module, "store", return_value=_Store()),
-        patch.object(module, "resolve_agent_cwd", AsyncMock(return_value="/workspace")),
-        patch.object(module, "antigravity_cli_binary_source", lambda: object()),
-        patch.object(
-            module, "ensure_agent_binary_installed", AsyncMock(return_value="/opt/agy")
-        ),
-        patch.object(module, "sandbox_agent_bridge", bridge_context),
-        patch.object(module, "build_user_prompt", return_value=("write files", False)),
+    _run_factory(
+        _Sandbox(),
         patch.object(module, "_run_antigravity_cli_centaur", capture_centaur),
-    ):
-        asyncio.run(
-            module.antigravity_cli(
-                centaur=CentaurOptions(),
-                version="1.1.27",
-                skip_permissions=False,
-                extra_args=["--sandbox"],
-            )(state)
-        )
+        centaur=CentaurOptions(),
+        skip_permissions=False,
+        extra_args=["--sandbox"],
+    )
 
     expected = [
         "/opt/agy",
