@@ -44,6 +44,7 @@ class _Sandbox(SandboxEnvironment):
         self.files: dict[str, str | bytes] = {}
         self.remote_calls: list[tuple[list[str], ExecRemoteAwaitableOptions, bool]] = []
         self.state_filter: Callable[[Sequence[ChatMessage]], bool] | None = None
+        self.result_stdout = _NATIVE_RESULT
 
     async def exec(
         self,
@@ -117,7 +118,9 @@ class _Sandbox(SandboxEnvironment):
         self.remote_calls.append((cmd, options, stream))
         assert self.state_filter is not None
         assert self.state_filter(_primary())
-        return ExecResult(success=True, returncode=0, stdout=_NATIVE_RESULT, stderr="")
+        return ExecResult(
+            success=True, returncode=0, stdout=self.result_stdout, stderr=""
+        )
 
     @classmethod
     async def sample_cleanup(
@@ -542,3 +545,59 @@ def test_extra_args_may_not_end_option_parsing() -> None:
     module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
     with pytest.raises(ValueError, match="end option parsing"):
         module.antigravity_cli(extra_args=["--sandbox", "--"])
+
+
+class _Transcript:
+    def __init__(self) -> None:
+        self.infos: list[tuple[object, str | None]] = []
+
+    def info(self, data: object, *, source: str | None = None) -> None:
+        self.infos.append((data, source))
+
+
+def _recorded_result(result_stdout: str) -> list[tuple[object, str | None]]:
+    module = importlib.import_module("inspect_swe._antigravity_cli.antigravity_cli")
+    sbox = _Sandbox()
+    sbox.result_stdout = result_stdout
+    recorder = _Transcript()
+    _run_factory(sbox, patch.object(module, "transcript", lambda: recorder))
+    return recorder.infos
+
+
+def test_unattended_factory_records_the_cli_result_in_the_transcript() -> None:
+    assert _recorded_result(_NATIVE_RESULT) == [
+        (
+            {
+                "status": "SUCCESS",
+                "conversation_id": _CID,
+                "denied_actions": [],
+                "response_empty": False,
+                "num_turns": 1,
+                "duration_seconds": 4.712014882,
+            },
+            "antigravity_cli",
+        )
+    ]
+
+
+def test_unattended_factory_records_denied_actions_and_an_empty_response() -> None:
+    denied = json.dumps(
+        {
+            "conversation_id": _CID,
+            "status": "SUCCESS",
+            "response": "",
+            "denied_actions": [{"action": "unsandboxed", "display_name": "RunCommand"}],
+            "duration_seconds": 2.5,
+            "num_turns": 1,
+        }
+    )
+    [(data, source)] = _recorded_result(denied)
+    assert source == "antigravity_cli"
+    assert data == {
+        "status": "SUCCESS",
+        "conversation_id": _CID,
+        "denied_actions": [{"action": "unsandboxed", "display_name": "RunCommand"}],
+        "response_empty": True,
+        "num_turns": 1,
+        "duration_seconds": 2.5,
+    }

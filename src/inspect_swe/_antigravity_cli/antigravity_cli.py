@@ -16,6 +16,7 @@ from inspect_ai.agent import (
     agent_with,
     sandbox_agent_bridge,
 )
+from inspect_ai.log import transcript
 from inspect_ai.model import (
     ChatMessage,
     ChatMessageSystem,
@@ -28,6 +29,7 @@ from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP, MCPServerConfigStdio
 from inspect_ai.util import sandbox as sandbox_env
 from inspect_ai.util import store
+from pydantic import JsonValue
 
 from .._util._async import is_callable_coroutine
 from .._util.agentbinary import ensure_agent_binary_installed
@@ -525,7 +527,9 @@ def antigravity_cli(
                             f"{_clean_antigravity_error(result.stdout, result.stderr)}"
                         )
 
-                    _verify_native_result(result.stdout, conversation.bound_id)
+                    _record_native_result(
+                        _verify_native_result(result.stdout, conversation.bound_id)
+                    )
 
                     attempt_count += 1
                     if attempt_count >= attempts.attempts:
@@ -837,8 +841,13 @@ def _native_result_json(stdout: str) -> Mapping[str, Any]:
     return parsed
 
 
-def _verify_native_result(stdout: str, conversation_id: str | None) -> None:
-    """Require a successful result from the exact conversation being scored."""
+def _verify_native_result(
+    stdout: str, conversation_id: str | None
+) -> Mapping[str, Any]:
+    """Require a successful result from the exact conversation being scored.
+
+    Returns the parsed result so the caller can record what the CLI reported.
+    """
     result = _native_result_json(stdout)
     status = result.get("status")
     if status != "SUCCESS":
@@ -866,6 +875,28 @@ def _verify_native_result(stdout: str, conversation_id: str | None) -> None:
             f"antigravity cli returned conversation {returned!r} but this run "
             f"bound {conversation_id!r}; refusing to score a conversation it did not run"
         )
+    return result
+
+
+def _record_native_result(result: Mapping[str, Any]) -> None:
+    """Record what the CLI reported about the invocation in the sample transcript.
+
+    The result is otherwise discarded once verified, so a run that agy ended
+    because it denied a tool call (`denied_actions`) would be indistinguishable in
+    the log from one the agent finished, and an invocation that returned
+    `SUCCESS` with an empty response would read as a clean completion.
+    """
+    denied = result.get("denied_actions")
+    response = result.get("response")
+    data: dict[str, JsonValue] = {
+        "status": result.get("status"),
+        "conversation_id": result.get("conversation_id"),
+        "denied_actions": denied if isinstance(denied, list) else [],
+        "response_empty": not (isinstance(response, str) and response.strip()),
+        "num_turns": result.get("num_turns"),
+        "duration_seconds": result.get("duration_seconds"),
+    }
+    transcript().info(data, source="antigravity_cli")
 
 
 async def _run_antigravity_cli_centaur(
