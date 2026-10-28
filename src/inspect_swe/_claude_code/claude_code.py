@@ -57,6 +57,7 @@ from inspect_swe._util.centaur import (
     CommandsFilter,
     run_centaur,
 )
+from inspect_swe._util.inspect_compat import bridge_request_header_args
 from inspect_swe._util.mcp_ready import (
     DEFAULT_MCP_READY_TIMEOUT,
     wait_for_mcp_endpoints,
@@ -77,6 +78,16 @@ from .model import ClaudeCodeEffort, resolve_claude_code_models
 ClaudeCodePermissionMode = Literal[
     "acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"
 ]
+
+# Claude Code names its session on every model request, and a subagent's
+# requests also name the subagent (and, when nested, its parent). Recorded on
+# each ModelEvent so a reader can group calls by the conversation the CLI
+# declared instead of inferring it from message prefixes. Measured on 2.1.310.
+CLAUDE_CODE_IDENTITY_HEADERS = (
+    "x-claude-code-session-id",
+    "x-claude-code-agent-id",
+    "x-claude-code-parent-agent-id",
+)
 
 
 class ClaudeCodeDeprecatedArgs(TypedDict, total=False):
@@ -323,6 +334,7 @@ def claude_code(
         )
 
     bridge_recovery_args = poll_timeout_recovery_bridge_args(poll_timeout_recovery)
+    bridge_header_args = bridge_request_header_args(CLAUDE_CODE_IDENTITY_HEADERS)
 
     # allocate session_id once per agent instance so that all calls to execute()
     # for the same sample share the same session. this enables --resume <id> to
@@ -385,6 +397,7 @@ def claude_code(
                 checkpointer=cp,
                 model_resolver=model_resolver,
                 accumulate_conversations=accumulate_conversations,
+                **bridge_header_args,
                 **bridge_recovery_args,
             ) as bridge,
         ):
