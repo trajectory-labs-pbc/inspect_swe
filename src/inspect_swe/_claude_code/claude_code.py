@@ -68,6 +68,16 @@ ClaudeCodePermissionMode = Literal[
     "acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"
 ]
 
+# Claude Code names its session on every model request, and a subagent's
+# requests also name the subagent (and, for a nested subagent, its parent).
+# Recorded on each model event so a log reader can group the calls by the
+# conversation Claude Code declared.
+CLAUDE_CODE_SESSION_HEADERS = (
+    "x-claude-code-session-id",
+    "x-claude-code-agent-id",
+    "x-claude-code-parent-agent-id",
+)
+
 
 class ClaudeCodeDeprecatedArgs(TypedDict, total=False):
     auto_mode: bool
@@ -360,6 +370,7 @@ def claude_code(
                 ),
                 model_event_sink=consumer,
                 checkpointer=cp,
+                model_event_metadata_headers=CLAUDE_CODE_SESSION_HEADERS,
             ) as bridge,
         ):
             if cp.attempt == "resume_for_scoring":
