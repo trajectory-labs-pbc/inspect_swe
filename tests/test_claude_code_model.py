@@ -102,3 +102,12 @@ def test_poll_timeout_recovery_unsupported_by_the_bridge_fails_construction() ->
         ),
     ):
         claude_code(model="mockllm/model", poll_timeout_recovery=900)
+
+
+def test_claude_code_identity_headers_are_recorded_by_the_bridge() -> None:
+    kwargs = bridge_call_kwargs(claude_code_module, claude_code(model="mockllm/model"))
+    assert kwargs["model_event_metadata_headers"] == (
+        "x-claude-code-session-id",
+        "x-claude-code-agent-id",
+        "x-claude-code-parent-agent-id",
+    )

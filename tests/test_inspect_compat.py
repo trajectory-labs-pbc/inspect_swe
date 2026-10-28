@@ -36,3 +36,31 @@ def test_bridge_request_headers_matches_fork_value_when_present() -> None:
     from inspect_swe._util.inspect_compat import BRIDGE_REQUEST_HEADERS
 
     assert BRIDGE_REQUEST_HEADERS == fork_value
+
+
+def _bridge_with_headers(*, model_event_metadata_headers: object = None) -> None:
+    raise AssertionError("signature stand-in; never called")
+
+
+def _bridge_without_headers(*, port: int = 13131) -> None:
+    raise AssertionError("signature stand-in; never called")
+
+
+def test_header_args_name_the_headers_when_the_bridge_records_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import inspect_swe._util.inspect_compat as compat
+
+    monkeypatch.setattr(compat, "sandbox_agent_bridge", _bridge_with_headers)
+    assert compat.bridge_request_header_args(["x-a", "x-b"]) == {
+        "model_event_metadata_headers": ("x-a", "x-b")
+    }
+
+
+def test_header_args_are_empty_when_the_bridge_cannot_record_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import inspect_swe._util.inspect_compat as compat
+
+    monkeypatch.setattr(compat, "sandbox_agent_bridge", _bridge_without_headers)
+    assert compat.bridge_request_header_args(["x-a"]) == {}
