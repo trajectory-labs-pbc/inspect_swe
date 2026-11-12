@@ -148,6 +148,7 @@ def claude_code(
     replace_system_prompt: str | None = None,
     allowlist_mcp_tools: bool = True,
     allowlist_bridged_tools: bool = True,
+    forward_client_headers: Mapping[str, Sequence[str]] | None = None,
     **deprecated_args: Unpack[ClaudeCodeDeprecatedArgs],
 ) -> Agent:
     """Claude Code agent.
@@ -261,6 +262,12 @@ def claude_code(
             bridged call is never reviewed. Left `True` under `"auto"`, a run
             whose entire tool surface is bridged produces ZERO adjudications and
             looks clean while being wholly unreviewed.
+        forward_client_headers: Client request headers the model bridge may
+            forward to the model provider, by header name and the values allowed
+            for it (passed unchanged as `sandbox_agent_bridge(forward_client_headers=...)`).
+            Claude Code sends feature flags such as `anthropic-beta` values that
+            the bridge drops unless they are listed here. Defaults to `None`,
+            the bridge's own default.
         **deprecated_args: Supports the deprecated `auto_mode` argument. Set
             `auto_mode=True` maps to `permission_mode="auto"`.
     """
@@ -327,6 +334,14 @@ def claude_code(
             model_aliases=model_aliases,
         )
 
+        # Passed only when given, so a bridge without the parameter still works
+        # for every caller that does not ask for it.
+        bridge_forward_header_args: dict[str, Any] = (
+            {"forward_client_headers": forward_client_headers}
+            if forward_client_headers is not None
+            else {}
+        )
+
         async with (
             checkpointer() as cp,
             sandbox_agent_bridge(
@@ -344,6 +359,7 @@ def claude_code(
                 ),
                 model_event_sink=consumer,
                 checkpointer=cp,
+                **bridge_forward_header_args,
             ) as bridge,
         ):
             if cp.attempt == "resume_for_scoring":
